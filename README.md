@@ -11,7 +11,7 @@
 pip install -r requirements.txt
 
 # Executar 
-python bot.py
+python slicerObd.py
 ```
 
 
