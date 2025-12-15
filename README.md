@@ -4,6 +4,7 @@
 - Resize
 - Color Remove
 - Slicer Png
+- Eraser
 - Export
 
 
