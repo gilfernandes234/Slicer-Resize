@@ -2,11 +2,12 @@
 
 - Resize
 - Color Remove
+- Paint Brush
 - Slicer Png
 - Eraser
 - Rotate
 - Flip
-- Selection/Move
+- Selection tools
 - Export
 
 
