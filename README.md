@@ -10,6 +10,7 @@
 - Flip
 - Selection tools
 - Outline/Adjust
+- Layer Panel
 - Denoise
 - Upscale
 - Export
