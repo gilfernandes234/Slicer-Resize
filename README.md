@@ -1,14 +1,16 @@
 # Sprite Editor 
 
 - Resize
-- Color Remove
+- Color Adjust/Remove
 - Paint Brush
 - Slicer Png
 - Eraser
 - Rotate
 - Flip
 - Selection tools
+- Outline/Adjust
 - Export
+
 
 
 
