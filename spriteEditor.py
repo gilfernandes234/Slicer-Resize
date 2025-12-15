@@ -16,7 +16,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QSize, QPoint, QPointF
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QIcon, QBrush, QWheelEvent, QKeyEvent
 
 
-# POR ISTO:
+# Imports condicionais (bibliotecas opcionais)
 try:
     import torch
     from realesrgan import RealESRGANer
@@ -26,6 +26,13 @@ try:
 except ImportError:
     REALESRGAN_AVAILABLE = False
     print("⚠️ Real-ESRGAN não está instalado.")
+
+try:
+    from rembg import remove
+    REMBG_AVAILABLE = True
+except ImportError:
+    REMBG_AVAILABLE = False
+    print("⚠️ rembg não está instalado.")
 
 
 class GridOverlay(QGraphicsObject):
@@ -204,6 +211,8 @@ class SliceWindow(QWidget):
         self.eraser_feathering = 0  # NOVA VARIÁVEL
         self.last_eraser_point = None
 
+        
+        
         
 
         self.paint_mode = False
@@ -447,6 +456,23 @@ class SliceWindow(QWidget):
 
         grp_transparency.setLayout(transparency_layout)
         tab_transparency_layout.addWidget(grp_transparency)
+        
+        
+        
+        # Na função init_ui, após o btn_remove_color
+        self.btn_remove_bg_ai = QPushButton("🤖 Remove Background (AI)")
+        self.btn_remove_bg_ai.setStyleSheet("background-color: #9c27b0; font-weight: bold; color: white;")
+        self.btn_remove_bg_ai.clicked.connect(self.remove_background_ai)
+        self.btn_remove_bg_ai.setEnabled(False)
+
+        if not REMBG_AVAILABLE:  # ← Use a variável global
+            self.btn_remove_bg_ai.setToolTip("rembg não instalado")
+        else:
+            self.btn_remove_bg_ai.setToolTip("Remove background usando IA (U2Net)")
+
+        transparency_layout.addWidget(self.btn_remove_bg_ai, 5, 0, 1, 2)
+
+        
 
         # GRUPO 2: Color Adjustments (NOVO)
         grp_color_adjust = QGroupBox("Color Adjustments")
@@ -546,6 +572,57 @@ class SliceWindow(QWidget):
         tab_transparency_layout.addWidget(grp_color_adjust)
 
         tab_transparency_layout.addStretch()
+        
+        
+        
+        
+        grp_paint = QGroupBox("Paint Brush")
+        paint_layout = QGridLayout()
+        
+        paint_layout.addWidget(QLabel("Brush Size:"), 0, 0)
+        self.spin_paint_size = QSpinBox()
+        self.spin_paint_size.setRange(1, 100)
+        self.spin_paint_size.setValue(5)
+        self.spin_paint_size.valueChanged.connect(self.on_paint_size_change)
+        paint_layout.addWidget(self.spin_paint_size, 0, 1)
+        
+
+        paint_layout.addWidget(QLabel("Feathering:"), 1, 0)
+        self.spin_paint_feathering = QSpinBox()
+        self.spin_paint_feathering.setRange(0, 100)
+        self.spin_paint_feathering.setValue(0)
+        self.spin_paint_feathering.setSuffix("%")
+        self.spin_paint_feathering.setToolTip("0% = bordas duras, 100% = máxima suavização")
+        self.spin_paint_feathering.valueChanged.connect(self.on_paint_feathering_change)
+        paint_layout.addWidget(self.spin_paint_feathering, 1, 1)
+        
+        self.btn_choose_color = QPushButton("Choose Color")
+        self.btn_choose_color.setStyleSheet("background-color: #555;")
+        self.btn_choose_color.clicked.connect(self.choose_paint_color)
+        self.btn_choose_color.setEnabled(False)
+        paint_layout.addWidget(self.btn_choose_color, 2, 0, 1, 2)
+        
+
+        self.btn_pick_paint_color = QPushButton("Pick Color from Image")
+        self.btn_pick_paint_color.setStyleSheet("background-color: #555;")
+        self.btn_pick_paint_color.clicked.connect(self.enable_paint_color_picker)
+        self.btn_pick_paint_color.setEnabled(False)
+        paint_layout.addWidget(self.btn_pick_paint_color, 3, 0, 1, 2)
+        
+        self.lbl_paint_color_preview = QLabel()
+        self.lbl_paint_color_preview.setFixedHeight(30)
+        self.lbl_paint_color_preview.setStyleSheet("background-color: #000000; border: 1px solid #222;")
+        paint_layout.addWidget(self.lbl_paint_color_preview, 4, 0, 1, 2)
+        
+        self.btn_toggle_paint = QPushButton("Enable Paint")
+        self.btn_toggle_paint.setCheckable(True)
+        self.btn_toggle_paint.setStyleSheet("background-color: #9b59b6; font-weight: bold;")
+        self.btn_toggle_paint.clicked.connect(self.toggle_paint_mode)
+        self.btn_toggle_paint.setEnabled(False)
+        paint_layout.addWidget(self.btn_toggle_paint, 5, 0, 1, 2)
+        
+        grp_paint.setLayout(paint_layout)
+        tab_transparency_layout.addWidget(grp_paint)        
 
         
         
@@ -632,54 +709,7 @@ class SliceWindow(QWidget):
         tab_slice_layout.addWidget(grp_eraser)
 
         
-   
-        grp_paint = QGroupBox("Paint Brush")
-        paint_layout = QGridLayout()
-        
-        paint_layout.addWidget(QLabel("Brush Size:"), 0, 0)
-        self.spin_paint_size = QSpinBox()
-        self.spin_paint_size.setRange(1, 100)
-        self.spin_paint_size.setValue(5)
-        self.spin_paint_size.valueChanged.connect(self.on_paint_size_change)
-        paint_layout.addWidget(self.spin_paint_size, 0, 1)
-        
-
-        paint_layout.addWidget(QLabel("Feathering:"), 1, 0)
-        self.spin_paint_feathering = QSpinBox()
-        self.spin_paint_feathering.setRange(0, 100)
-        self.spin_paint_feathering.setValue(0)
-        self.spin_paint_feathering.setSuffix("%")
-        self.spin_paint_feathering.setToolTip("0% = bordas duras, 100% = máxima suavização")
-        self.spin_paint_feathering.valueChanged.connect(self.on_paint_feathering_change)
-        paint_layout.addWidget(self.spin_paint_feathering, 1, 1)
-        
-        self.btn_choose_color = QPushButton("Choose Color")
-        self.btn_choose_color.setStyleSheet("background-color: #555;")
-        self.btn_choose_color.clicked.connect(self.choose_paint_color)
-        self.btn_choose_color.setEnabled(False)
-        paint_layout.addWidget(self.btn_choose_color, 2, 0, 1, 2)
-        
-
-        self.btn_pick_paint_color = QPushButton("Pick Color from Image")
-        self.btn_pick_paint_color.setStyleSheet("background-color: #555;")
-        self.btn_pick_paint_color.clicked.connect(self.enable_paint_color_picker)
-        self.btn_pick_paint_color.setEnabled(False)
-        paint_layout.addWidget(self.btn_pick_paint_color, 3, 0, 1, 2)
-        
-        self.lbl_paint_color_preview = QLabel()
-        self.lbl_paint_color_preview.setFixedHeight(30)
-        self.lbl_paint_color_preview.setStyleSheet("background-color: #000000; border: 1px solid #222;")
-        paint_layout.addWidget(self.lbl_paint_color_preview, 4, 0, 1, 2)
-        
-        self.btn_toggle_paint = QPushButton("Enable Paint")
-        self.btn_toggle_paint.setCheckable(True)
-        self.btn_toggle_paint.setStyleSheet("background-color: #9b59b6; font-weight: bold;")
-        self.btn_toggle_paint.clicked.connect(self.toggle_paint_mode)
-        self.btn_toggle_paint.setEnabled(False)
-        paint_layout.addWidget(self.btn_toggle_paint, 5, 0, 1, 2)
-        
-        grp_paint.setLayout(paint_layout)
-        tab_transparency_layout.addWidget(grp_paint)
+ 
 
         grp_selection = QGroupBox("Selection Tool")
         selection_layout = QGridLayout()
@@ -894,6 +924,62 @@ class SliceWindow(QWidget):
         rp_layout.addWidget(btn_clear)
 
         content_layout.addWidget(right_panel)
+        
+        
+        
+    def remove_background_ai(self):
+        """Remove background automaticamente usando IA (rembg)"""
+        if not self.current_image_pil:
+            return
+        
+        if not REMBG_AVAILABLE:  # ← Use a variável global aqui
+            QMessageBox.critical(
+                self,
+                "Biblioteca Faltando",
+                "rembg não está instalado!\nInstale com: pip install rembg"
+            )
+            return
+        
+        self.save_state()
+        
+        try:
+            from rembg import remove  # Importa aqui de novo (já foi importado no topo)
+            import io
+            
+            # Mostrar mensagem de progresso
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            
+            # Converte PIL Image para bytes
+            img_byte_arr = io.BytesIO()
+            self.current_image_pil.save(img_byte_arr, format='PNG')
+            img_byte_arr = img_byte_arr.getvalue()
+            
+            # Remove background
+            output_data = remove(img_byte_arr)
+            
+            # Converte de volta para PIL Image
+            output_image = Image.open(io.BytesIO(output_data))
+            
+            # Garante que está em RGBA
+            if output_image.mode != 'RGBA':
+                output_image = output_image.convert('RGBA')
+            
+            self.current_image_pil = output_image
+            self.update_canvas_image()
+            
+            QApplication.restoreOverrideCursor()
+            
+            QMessageBox.information(
+                self,
+                "Background Removed",
+                "Background removido automaticamente com sucesso usando IA!"
+            )
+            
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Error", f"Erro ao remover background: {str(e)}")
+            
         
         
         
@@ -1181,6 +1267,10 @@ class SliceWindow(QWidget):
             
             img = self.current_image_pil.copy()
             
+            # Garante que está em RGBA
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            
             # 1. Brightness
             brightness_val = self.slider_brightness.value()
             if brightness_val != 0:
@@ -1202,25 +1292,29 @@ class SliceWindow(QWidget):
                 enhancer = ImageEnhance.Color(img)
                 img = enhancer.enhance(factor)
             
-            # 4. RGB Adjustments
+            # 4. RGB Adjustments (método eficiente com numpy)
             red_val = self.slider_red.value()
             green_val = self.slider_green.value()
             blue_val = self.slider_blue.value()
             
             if red_val != 0 or green_val != 0 or blue_val != 0:
-                pixels = img.load()
-                w, h = img.size
+                # Converte para numpy array para manipulação eficiente
+                img_array = np.array(img)
                 
-                for y in range(h):
-                    for x in range(w):
-                        r, g, b, a = pixels[x, y]
-                        
-                        # Ajusta cada canal
-                        new_r = max(0, min(255, r + red_val))
-                        new_g = max(0, min(255, g + green_val))
-                        new_b = max(0, min(255, b + blue_val))
-                        
-                        pixels[x, y] = (new_r, new_g, new_b, a)
+                # Separa os canais
+                r, g, b, a = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2], img_array[:,:,3]
+                
+                # Ajusta cada canal e clipa entre 0-255
+                r = np.clip(r.astype(np.int16) + red_val, 0, 255).astype(np.uint8)
+                g = np.clip(g.astype(np.int16) + green_val, 0, 255).astype(np.uint8)
+                b = np.clip(b.astype(np.int16) + blue_val, 0, 255).astype(np.uint8)
+                
+                # Reconstrói a imagem
+                img_array[:,:,0] = r
+                img_array[:,:,1] = g
+                img_array[:,:,2] = b
+                
+                img = Image.fromarray(img_array, 'RGBA')
             
             self.current_image_pil = img
             self.update_canvas_image()
@@ -1232,9 +1326,11 @@ class SliceWindow(QWidget):
             )
             
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Erro ao aplicar ajustes: {str(e)}")
-           
-        
+            import traceback
+            error_details = traceback.format_exc()
+            QMessageBox.critical(self, "Error", f"Erro ao aplicar ajustes: {str(e)}\n\n{error_details}")
+
+
         
     def on_eraser_feathering_change(self, value):
         """Atualiza o feathering da borracha"""
@@ -1902,10 +1998,14 @@ class SliceWindow(QWidget):
                 self.btn_erase_edges.setEnabled(True)
                 self.btn_apply_denoise.setEnabled(True)
                 self.btn_apply_upscale.setEnabled(True)
+                self.btn_apply_color.setEnabled(True)
+                self.btn_reset_color.setEnabled(True)
+
+                # Onde você habilita os outros botões:
+                if REMBG_AVAILABLE:  # ← Use a variável global
+                    self.btn_remove_bg_ai.setEnabled(True)
 
                 
-                
-
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -2265,6 +2365,9 @@ class SliceWindow(QWidget):
         self.spin_resize_height.setValue(h)
         self.spin_resize_width.blockSignals(False)
         self.spin_resize_height.blockSignals(False)
+         # Na função reset_to_original() e onde limpar a imagem:
+        self.btn_remove_bg_ai.setEnabled(False)
+       
         
         self.update_canvas_image()
                     
@@ -2409,9 +2512,17 @@ class SliceWindow(QWidget):
         qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888)
         return qimage
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = SliceWindow()
-    window.show()
-    window.showMaximized()
-    sys.exit(app.exec())
+if __name__ == '__main__':
+    import sys
+    try:
+        app = QApplication(sys.argv)
+        window = SliceWindow()
+        window.show()
+        window.showMaximized()
+        sys.exit(app.exec())
+    except Exception as e:
+        print(f"❌ ERRO FATAL: {e}")
+        import traceback
+        traceback.print_exc()
+        input("Pressione ENTER para fechar...")
+
