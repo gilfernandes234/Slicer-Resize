@@ -1,8 +1,12 @@
 import io
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import uuid
 from copy import deepcopy
+
 
 from PIL import Image, ImageDraw, ImageFilter
 from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
@@ -52,7 +56,7 @@ from PyQt6.QtWidgets import (
 
 
 class Layer:
-
+    """Representa uma camada de imagem"""
 
     def __init__(self, name="Layer", image=None, x=0, y=0):
         self.id = str(uuid.uuid4())
@@ -219,24 +223,29 @@ class DraggableLayerItem(QGraphicsPixmapItem):
         super().hoverLeaveEvent(event)
 
 
-try:
-    import torch
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from realesrgan import RealESRGANer
-    from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-
-    REALESRGAN_AVAILABLE = True
-except ImportError:
-    REALESRGAN_AVAILABLE = False
-    print("⚠️ Real-ESRGAN não está instalado.")
+if getattr(sys, 'frozen', False):
+    _base_path = os.path.dirname(sys.executable)
+else:
+    _base_path = os.path.dirname(os.path.abspath(__file__))
 
 try:
     from rembg import remove
-
     REMBG_AVAILABLE = True
 except ImportError:
     REMBG_AVAILABLE = False
-    print("⚠️ rembg não está instalado.")
+
+try:
+    import numpy as np
+    import torch
+    from realesrgan import RealESRGANer
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    ESRGAN_AVAILABLE = True
+except ImportError:
+    ESRGAN_AVAILABLE = False
+
+WAIFU_EXE = os.path.join(_base_path, "data", "upscale2.exe")
+WAIFU_AVAILABLE = os.path.isfile(WAIFU_EXE)
+
 
 
 class GridOverlay(QGraphicsObject):
@@ -390,6 +399,51 @@ class SelectionRectangle(QGraphicsRectItem):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setCursor(Qt.CursorShape.SizeAllCursor)
         super().mouseReleaseEvent(event)
+        
+        
+class EraserOverlay(QGraphicsObject):
+
+    def __init__(self):
+        super().__init__()
+        self.size = 10
+        self.position = QPointF(0, 0)
+        self.visible = False
+        self.setZValue(100)  # Mantém sempre no topo
+        
+    def boundingRect(self):
+        radius = self.size / 2
+        return QRectF(-radius, -radius, self.size, self.size)
+    
+    def paint(self, painter, option, widget):
+        if not self.visible:
+            return
+        
+        radius = self.size / 2
+        
+        # Círculo externo (borda)
+        pen = QPen(QColor(255, 100, 100, 200), 2, Qt.PenStyle.SolidLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))
+        painter.drawEllipse(QPointF(0, 0), radius, radius)
+        
+        # Cruz central para indicar o centro exato
+        cross_size = 3
+        painter.drawLine(-cross_size, 0, cross_size, 0)
+        painter.drawLine(0, -cross_size, 0, cross_size)
+    
+    def setSize(self, size):
+        self.prepareGeometryChange()
+        self.size = size
+        self.update()
+    
+    def setVisible(self, visible):
+        self.visible = visible
+        self.update()
+    
+    def updatePosition(self, pos):
+        self.setPos(pos)
+        
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -432,6 +486,9 @@ class ZoomableGraphicsView(QGraphicsView):
 
 
 class SliceWindow(QWidget):
+    
+    sprites_imported = pyqtSignal(list)    
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Sprite Editor - Made by Sherrat")
@@ -454,7 +511,7 @@ class SliceWindow(QWidget):
         self.last_eraser_point = None
         
         self.cut_size_mode = False
-        self.rotate_fine_angle = 0        
+        self.rotate_fine_angle = 0             
         self.cut_rect_item = None
         self.is_drawing_cut_rect = False
         self.cut_start_pos = None        
@@ -518,7 +575,7 @@ class SliceWindow(QWidget):
         tb_layout.addWidget(btn_open)
 
         # Novo botão: Export Project (exporta a imagem atual inteira, sem slices)
-        btn_export_project = QPushButton("Export Project")
+        btn_export_project = QPushButton("Export Imagem Completa ")
         btn_export_project.setStyleSheet(
             "background-color: #28a745; padding: 5px; font-weight: bold;"
         )
@@ -643,6 +700,52 @@ class SliceWindow(QWidget):
         grp_resize.setLayout(resize_layout)
         tab_resize_layout.addWidget(grp_resize)
 
+        # ===== PIXEL SNAP (AI → Pixel Art) =====
+        grp_pixel_snap = QGroupBox("Pixel Snap (AI → Pixel Art)")
+        pixel_snap_layout = QGridLayout()
+
+        # Posterizar
+        self.chk_snap_posterize = QCheckBox("Posterizar Cores")
+        self.chk_snap_posterize.setChecked(True)
+        self.chk_snap_posterize.setToolTip("Reduz gradientes suaves para cores chapadas")
+        pixel_snap_layout.addWidget(self.chk_snap_posterize, 0, 0)
+
+        pixel_snap_layout.addWidget(QLabel("Níveis:"), 0, 1)
+        self.spin_snap_posterize = QSpinBox()
+        self.spin_snap_posterize.setRange(2, 32)
+        self.spin_snap_posterize.setValue(8)
+        self.spin_snap_posterize.setToolTip("Níveis por canal (2=muito reduzido, 8=suave)")
+        pixel_snap_layout.addWidget(self.spin_snap_posterize, 0, 2)
+
+        # Limitar paleta
+        self.chk_snap_quantize = QCheckBox("Limitar Paleta")
+        self.chk_snap_quantize.setChecked(False)
+        self.chk_snap_quantize.setToolTip("Reduz o total de cores (K-means)")
+        pixel_snap_layout.addWidget(self.chk_snap_quantize, 1, 0)
+
+        pixel_snap_layout.addWidget(QLabel("Cores:"), 1, 1)
+        self.spin_snap_colors = QSpinBox()
+        self.spin_snap_colors.setRange(2, 256)
+        self.spin_snap_colors.setValue(32)
+        pixel_snap_layout.addWidget(self.spin_snap_colors, 1, 2)
+
+        # Snap alpha
+        self.chk_snap_alpha = QCheckBox("Snap Alpha (bordas duras)")
+        self.chk_snap_alpha.setChecked(True)
+        self.chk_snap_alpha.setToolTip("Binariza o canal alpha para bordas 100% nítidas")
+        pixel_snap_layout.addWidget(self.chk_snap_alpha, 2, 0, 1, 3)
+
+        # Botão
+        self.btn_apply_pixel_snap = QPushButton("🎮 Apply Pixel Snap")
+        self.btn_apply_pixel_snap.setStyleSheet(
+            "background-color: #e91e63; font-weight: bold; color: white;"
+        )
+        self.btn_apply_pixel_snap.clicked.connect(self.apply_pixel_snap)
+        self.btn_apply_pixel_snap.setEnabled(False)
+        pixel_snap_layout.addWidget(self.btn_apply_pixel_snap, 3, 0, 1, 3)
+
+        grp_pixel_snap.setLayout(pixel_snap_layout)
+        tab_resize_layout.addWidget(grp_pixel_snap)
 
         grp_edges = QGroupBox("Edge Detection & Outline")
         edges_layout = QGridLayout()
@@ -676,9 +779,11 @@ class SliceWindow(QWidget):
         edges_layout.addWidget(self.lbl_outline_color_preview, 4, 0, 1, 2)
 
         edges_layout.addWidget(QLabel("Thickness:"), 5, 0)
-        self.spin_outline_thickness = QSpinBox()
-        self.spin_outline_thickness.setRange(1, 20)
-        self.spin_outline_thickness.setValue(2)
+        self.spin_outline_thickness = QDoubleSpinBox()
+        self.spin_outline_thickness.setRange(0.01, 20.0)
+        self.spin_outline_thickness.setValue(2.0)
+        self.spin_outline_thickness.setSingleStep(0.01)
+        self.spin_outline_thickness.setDecimals(2)
         self.spin_outline_thickness.setSuffix("px")
         edges_layout.addWidget(self.spin_outline_thickness, 5, 1)
 
@@ -704,11 +809,13 @@ class SliceWindow(QWidget):
         edges_layout.addWidget(QLabel("Edge Eraser:"), 8, 0, 1, 2)
 
         edges_layout.addWidget(QLabel("Distance:"), 9, 0)
-        self.spin_edge_eraser_distance = QSpinBox()
-        self.spin_edge_eraser_distance.setRange(1, 50)
-        self.spin_edge_eraser_distance.setValue(5)
+        self.spin_edge_eraser_distance = QDoubleSpinBox()
+        self.spin_edge_eraser_distance.setRange(0.01, 50.0)
+        self.spin_edge_eraser_distance.setValue(5.0)
+        self.spin_edge_eraser_distance.setSingleStep(0.01)
+        self.spin_edge_eraser_distance.setDecimals(2)
         self.spin_edge_eraser_distance.setSuffix("px")
-        self.spin_edge_eraser_distance.setToolTip("Distância das bordas para apagar")
+        self.spin_edge_eraser_distance.setToolTip("Distância das bordas para apagar (use valores decimais para ajustes finos)")
         edges_layout.addWidget(self.spin_edge_eraser_distance, 9, 1)
 
         edges_layout.addWidget(QLabel("Feathering:"), 10, 0)
@@ -962,11 +1069,10 @@ class SliceWindow(QWidget):
 
         grp_cells = QGroupBox("Cells")
         grp_cells_layout = QGridLayout()
-        
         self.chk_subdivisions = QCheckBox("Subdivisions")
         self.chk_subdivisions.toggled.connect(self.update_grid_visuals)
         self.chk_subdivisions.setVisible(False)       
-        grp_cells_layout.addWidget(self.chk_subdivisions, 0, 0, 1, 2)        
+        grp_cells_layout.addWidget(self.chk_subdivisions, 0, 0, 1, 2)   
 
         self.chk_empty = QCheckBox("Empty Sprites")
         self.chk_empty.setToolTip(
@@ -1091,10 +1197,7 @@ class SliceWindow(QWidget):
 
         grp_selection.setLayout(selection_layout)
         tab_slice_layout.addWidget(grp_selection)
-        
-        
-        
-        # GRUPO: Rotate Fine (NOVO)
+                # GRUPO: Rotate Fine (NOVO)
         grp_rotate_fine = QGroupBox("Rotate Fine")
         rotate_fine_layout = QGridLayout()
 
@@ -1156,31 +1259,16 @@ class SliceWindow(QWidget):
         tab_upscale = QWidget()
         tab_upscale_layout = QVBoxLayout(tab_upscale)
 
-        # GRUPO 1: Denoise (que já discutimos)
-        grp_denoise = QGroupBox("Denoise (Noise Reduction)")
+        # GRUPO 1: Denoise (Waifu2x)
+        grp_denoise = QGroupBox("Denoise (Waifu2x)")
         denoise_layout = QGridLayout()
 
-        denoise_layout.addWidget(QLabel("Method:"), 0, 0)
-        self.combo_denoise_method = QComboBox()
-        self.combo_denoise_method.addItems(
-            ["Median Filter", "Gaussian Blur", "Smooth Filter", "Smooth More"]
-        )
-        denoise_layout.addWidget(self.combo_denoise_method, 0, 1)
-
-        denoise_layout.addWidget(QLabel("Strength:"), 1, 0)
-        self.spin_denoise_strength = QDoubleSpinBox()
-        self.spin_denoise_strength.setRange(0.1, 10.0)
-        self.spin_denoise_strength.setValue(1.0)
-        self.spin_denoise_strength.setSingleStep(0.1)
-        self.spin_denoise_strength.setDecimals(2)
-
-
-
-
-        self.spin_denoise_strength.setToolTip(
-            "Kernel size para Median ou raio para Gaussian"
-        )
-        denoise_layout.addWidget(self.spin_denoise_strength, 1, 1)
+        denoise_layout.addWidget(QLabel("Noise Level:"), 0, 0)
+        self.combo_denoise_level = QComboBox()
+        self.combo_denoise_level.addItems(["0", "1", "2", "3"])
+        self.combo_denoise_level.setCurrentIndex(1)
+        self.combo_denoise_level.setToolTip("0 = sem denoise, 3 = máximo")
+        denoise_layout.addWidget(self.combo_denoise_level, 0, 1)
 
         self.btn_apply_denoise = QPushButton("Apply Denoise")
         self.btn_apply_denoise.setStyleSheet(
@@ -1188,46 +1276,45 @@ class SliceWindow(QWidget):
         )
         self.btn_apply_denoise.clicked.connect(self.apply_denoise)
         self.btn_apply_denoise.setEnabled(False)
-        denoise_layout.addWidget(self.btn_apply_denoise, 2, 0, 1, 2)
+        if not WAIFU_AVAILABLE:
+            self.btn_apply_denoise.setToolTip(f"upscale2.exe não encontrado em:\n{WAIFU_EXE}")
+        denoise_layout.addWidget(self.btn_apply_denoise, 1, 0, 1, 2)
 
         grp_denoise.setLayout(denoise_layout)
         tab_upscale_layout.addWidget(grp_denoise)
 
-        grp_upscale = QGroupBox("AI Upscale (Real-ESRGAN)")
+        grp_upscale = QGroupBox("AI Upscale")
         upscale_layout = QGridLayout()
 
-        upscale_layout.addWidget(QLabel("Model:"), 0, 0)
-        self.combo_upscale_model = QComboBox()
-        self.combo_upscale_model.addItems(
-            [
-                "RealESRGAN x4 (General)",
-                "RealESRGAN x4 Anime",
-                "RealESRGAN x2",
-            ]
-        )
-        self.combo_upscale_model.setCurrentIndex(1)
-        upscale_layout.addWidget(self.combo_upscale_model, 0, 1)
+        upscale_layout.addWidget(QLabel("Method:"), 0, 0)
+        self.combo_upscale_method = QComboBox()
+        self.combo_upscale_method.addItems(["Waifu2x", "Real-ESRGAN"])
+        self.combo_upscale_method.setCurrentIndex(0)
+        self.combo_upscale_method.currentTextChanged.connect(self.on_upscale_method_changed)
+        upscale_layout.addWidget(self.combo_upscale_method, 0, 1)
 
         upscale_layout.addWidget(QLabel("Scale Factor:"), 1, 0)
         self.combo_upscale_factor = QComboBox()
-        self.combo_upscale_factor.addItems(["2x", "3x", "4x"])
-        self.combo_upscale_factor.setCurrentIndex(2)
+        self.combo_upscale_factor.addItems(["2x", "4x"])
+        self.combo_upscale_factor.setCurrentIndex(0)
         upscale_layout.addWidget(self.combo_upscale_factor, 1, 1)
 
-        # NOVA OPÇÃO: Manter resolução original
+        self.lbl_upscale_noise = QLabel("Noise Level:")
+        upscale_layout.addWidget(self.lbl_upscale_noise, 2, 0)
+        self.combo_upscale_noise = QComboBox()
+        self.combo_upscale_noise.addItems(["0", "1", "2", "3"])
+        self.combo_upscale_noise.setCurrentIndex(1)
+        self.combo_upscale_noise.setToolTip("Nível de denoise aplicado junto ao upscale")
+        upscale_layout.addWidget(self.combo_upscale_noise, 2, 1)
+
+        # Manter resolução original
         self.chk_keep_original_size = QCheckBox("Keep Original Resolution")
         self.chk_keep_original_size.setChecked(False)
         self.chk_keep_original_size.setToolTip(
             "Faz upscale para melhorar qualidade, depois redimensiona\n"
             "de volta para a resolução original (melhora detalhes)"
         )
-        upscale_layout.addWidget(self.chk_keep_original_size, 2, 0, 1, 2)
-
-        # Opção de usar GPU
-        self.chk_use_gpu = QCheckBox("Use GPU (CUDA)")
-        self.chk_use_gpu.setChecked(False)
-        self.chk_use_gpu.setToolTip("Requer NVIDIA GPU com CUDA instalado")
-        upscale_layout.addWidget(self.chk_use_gpu, 3, 0, 1, 2)
+        upscale_layout.addWidget(self.chk_keep_original_size, 3, 0, 1, 2)
 
         # Botão Apply
         self.btn_apply_upscale = QPushButton("Apply AI Upscale")
@@ -1235,23 +1322,13 @@ class SliceWindow(QWidget):
             "background-color: #28a745; font-weight: bold;"
         )
         self.btn_apply_upscale.clicked.connect(self.apply_ai_upscale)
-
-        if not REALESRGAN_AVAILABLE:
-            self.btn_apply_upscale.setEnabled(False)
-            self.btn_apply_upscale.setToolTip("Real-ESRGAN não instalado")
-        else:
-            self.btn_apply_upscale.setEnabled(False)
-
+        self.btn_apply_upscale.setEnabled(False)
         upscale_layout.addWidget(self.btn_apply_upscale, 4, 0, 1, 2)
 
         # Label de status
         self.lbl_upscale_status = QLabel("")
         self.lbl_upscale_status.setStyleSheet("color: #aaa; font-size: 10px;")
         self.lbl_upscale_status.setWordWrap(True)
-
-        if not REALESRGAN_AVAILABLE:
-            self.lbl_upscale_status.setText("⚠️ Real-ESRGAN não disponível")
-
         upscale_layout.addWidget(self.lbl_upscale_status, 5, 0, 1, 2)
 
         grp_upscale.setLayout(upscale_layout)
@@ -1284,8 +1361,14 @@ class SliceWindow(QWidget):
 
         self.scene = QGraphicsScene()
         self.scene.setBackgroundBrush(QColor(50, 50, 50))
+        
+        self.eraser_overlay = EraserOverlay()
+        self.scene.addItem(self.eraser_overlay)
+        self.eraser_overlay.setVisible(False)        
+  
 
         self.view = ZoomableGraphicsView(self.scene, self)
+        self.view.setMouseTracking(True)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -1323,15 +1406,13 @@ class SliceWindow(QWidget):
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
         self.list_widget.setIconSize(QSize(32, 32))
         self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
-        
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self.on_list_context_menu)
                 
         
         rp_layout.addWidget(self.list_widget)
-        
 
-        self.btn_export = QPushButton("Export PNG")
+        self.btn_export = QPushButton("Export PNG (Cortado)")
         self.btn_export.setFixedHeight(30)
         self.btn_export.setStyleSheet(
             "background-color: #28a745; color: white; font-weight: bold;"
@@ -1345,7 +1426,7 @@ class SliceWindow(QWidget):
         self.btn_import.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
         self.btn_import.clicked.connect(self.import_sprites)
         self.btn_import.setEnabled(False)
-        self.btn_import.setVisible(False)        
+        self.btn_import.setVisible(False)  # não utilizado em StandAlone
         rp_layout.addWidget(self.btn_import)        
         
         
@@ -1358,8 +1439,7 @@ class SliceWindow(QWidget):
 
 
         self.create_layers_panel()
-        
-        
+
     def on_list_context_menu(self, position):
         """Exibe menu de contexto ao clicar direito em sprite"""
         item = self.list_widget.itemAt(position)
@@ -2228,231 +2308,14 @@ class SliceWindow(QWidget):
             QMessageBox.information(
                 self,
                 "Background Removed",
+                "Background removido automaticamente com sucesso usando IA!",
             )
 
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Error", f"Erro ao remover background: {str(e)}")
 
-    def apply_denoise(self):
-        if not self.current_image_pil:
-            return
-
-        self.save_state()
-
-        try:
-            method = self.combo_denoise_method.currentIndex()
-            strength = float(self.spin_denoise_strength.value())  # Força float
-            
-            img = self.current_image_pil.copy()
-
-            if method == 0:  # Median Filter
-                # Converte para int e garante que é ímpar
-                kernel_size = int(strength * 2) + 1
-                if kernel_size < 1:
-                    kernel_size = 1
-                img = img.filter(ImageFilter.MedianFilter(size=kernel_size))
-
-            elif method == 1:  # Gaussian Blur
-                # Gaussian aceita float diretamente
-                img = img.filter(ImageFilter.GaussianBlur(radius=strength))
-
-            elif method == 2:  # Smooth
-                for _ in range(max(1, int(strength))):
-                    img = img.filter(ImageFilter.SMOOTH)
-
-            elif method == 3:  # Smooth More
-                for _ in range(max(1, int(strength))):
-                    img = img.filter(ImageFilter.SMOOTH_MORE)
-
-            self.current_image_pil = img
-            self.update_canvas_image()
-
-            QMessageBox.information(
-                self,
-                "Denoise Applied",
-                f"Denoise aplicado com sucesso!\n"
-                f"Método: {self.combo_denoise_method.currentText()}\n"
-                f"Força: {strength}"
-            )
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Erro ao aplicar denoise: {str(e)}")
-
-
-
-    def apply_ai_upscale(self):
-        if not self.current_image_pil:
-            return
-
-        if not REALESRGAN_AVAILABLE:
-            QMessageBox.critical(
-                self, "Dependência Faltando", "Real-ESRGAN não está instalado!"
-            )
-            return
-
-        # Guardar resolução original
-        original_width = self.current_image_pil.width
-        original_height = self.current_image_pil.height
-        keep_original_size = self.chk_keep_original_size.isChecked()
-
-        self.btn_apply_upscale.setEnabled(False)
-        self.lbl_upscale_status.setText("⏳ Carregando modelo...")
-        QApplication.processEvents()
-
-        try:
-            import cv2
-            import numpy as np
-
-            # Configurar device
-            use_gpu = self.chk_use_gpu.isChecked()
-            device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-
-            # Determinar modelo e escala
-            model_idx = self.combo_upscale_model.currentIndex()
-            scale_text = self.combo_upscale_factor.currentText()
-            scale = int(scale_text.replace("x", ""))
-
-            self.lbl_upscale_status.setText(f"⏳ Inicializando modelo...")
-            QApplication.processEvents()
-
-            # Configurar modelo baseado na seleção
-            if model_idx == 0:  # General x4
-                model = RRDBNet(
-                    num_in_ch=3,
-                    num_out_ch=3,
-                    num_feat=64,
-                    num_block=23,
-                    num_grow_ch=32,
-                    scale=4,
-                )
-                model_path = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-                netscale = 4
-            elif model_idx == 1:  # Anime x4
-                model = RRDBNet(
-                    num_in_ch=3,
-                    num_out_ch=3,
-                    num_feat=64,
-                    num_block=6,
-                    num_grow_ch=32,
-                    scale=4,
-                )
-                model_path = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
-                netscale = 4
-            else:  # x2
-                model = RRDBNet(
-                    num_in_ch=3,
-                    num_out_ch=3,
-                    num_feat=64,
-                    num_block=23,
-                    num_grow_ch=32,
-                    scale=2,
-                )
-                model_path = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
-                netscale = 2
-
-            # Criar upsampler
-            upsampler = RealESRGANer(
-                scale=netscale,
-                model_path=model_path,
-                model=model,
-                tile=0,
-                tile_pad=10,
-                pre_pad=0,
-                half=False,
-                device=device,
-            )
-
-            self.lbl_upscale_status.setText("⏳ Processando upscale...")
-            QApplication.processEvents()
-
-            # Converter PIL para numpy array (BGR para OpenCV)
-            img_rgb = self.current_image_pil.convert("RGB")
-            img_np = np.array(img_rgb)
-            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-            # Aplicar upscaling
-            output, _ = upsampler.enhance(img_bgr, outscale=scale)
-
-            # Converter de volta para PIL (BGR -> RGB)
-            output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-            upscaled_image = Image.fromarray(output_rgb)
-
-            # Se tinha transparência, processar canal alpha
-            if self.current_image_pil.mode == "RGBA":
-                alpha = self.current_image_pil.split()[-1]
-                alpha_upscaled = alpha.resize(
-                    (upscaled_image.width, upscaled_image.height), Image.LANCZOS
-                )
-                upscaled_image = upscaled_image.convert("RGBA")
-                upscaled_image.putalpha(alpha_upscaled)
-
-            # NOVA LÓGICA: Manter resolução original se checkbox marcada
-            if keep_original_size:
-                self.lbl_upscale_status.setText(
-                    "⏳ Redimensionando para resolução original..."
-                )
-                QApplication.processEvents()
-
-                # Usar LANCZOS para melhor qualidade no downscale
-                upscaled_image = upscaled_image.resize(
-                    (original_width, original_height), Image.LANCZOS
-                )
-
-                result_msg = (
-                    f"Imagem processada com sucesso!\n\n"
-                    f"Upscale temporário: {scale}x\n"
-                    f"Resolução final: {original_width}x{original_height} (original mantida)\n"
-                    f"Device: {device}\n\n"
-                    f"Qualidade melhorada através de upscale + downscale!"
-                )
-            else:
-                result_msg = (
-                    f"Imagem upscaled com sucesso!\n\n"
-                    f"Escala: {scale}x\n"
-                    f"Resolução original: {original_width}x{original_height}\n"
-                    f"Nova resolução: {upscaled_image.width}x{upscaled_image.height}\n"
-                    f"Device: {device}"
-                )
-
-            # Salvar estado
-            self.save_state()
-
-            # Atualizar imagem
-            self.current_image_pil = upscaled_image
-            self.update_canvas_image()
-
-            # Atualizar spinboxes
-            self.spin_resize_width.setValue(upscaled_image.width)
-            self.spin_resize_height.setValue(upscaled_image.height)
-
-            if keep_original_size:
-                self.lbl_upscale_status.setText(
-                    f"✅ Upscale completo!\n"
-                    f"Resolução mantida: {original_width}x{original_height}"
-                )
-            else:
-                self.lbl_upscale_status.setText(
-                    f"✅ Upscale completo! {scale}x\n"
-                    f"Nova resolução: {upscaled_image.width}x{upscaled_image.height}"
-                )
-
-            QMessageBox.information(self, "AI Upscale Complete", result_msg)
-
-        except Exception as e:
-            import traceback
-
-            error_details = traceback.format_exc()
-            self.lbl_upscale_status.setText(f"❌ Erro: {str(e)}")
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Erro ao aplicar AI upscale:\n{str(e)}\n\n{error_details}",
-            )
-
-        finally:
-            self.btn_apply_upscale.setEnabled(True)
-
+    
 
 
     def on_brightness_change(self, value):
@@ -2975,38 +2838,40 @@ class SliceWindow(QWidget):
 
         QMessageBox.information(self, "Paste", f"Colado em ({x}, {y})")
 
+
+            
     def toggle_eraser_mode(self, checked):
         self.eraser_mode = checked
-
         if checked:
             if self.selection_mode:
-                self.btn_toggle_selection.setChecked(False)
+                self.btn_toggle_eraser.setChecked(False)
                 self.toggle_selection_mode(False)
             if self.paint_mode:
                 self.btn_toggle_paint.setChecked(False)
                 self.toggle_paint_mode(False)
-
             self.btn_toggle_eraser.setText("Disable Eraser")
-            self.btn_toggle_eraser.setStyleSheet(
-                "background-color: #51cf66; font-weight: bold;"
-            )
+            self.btn_toggle_eraser.setStyleSheet("background-color: #51cf66; font-weight: bold")
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.view.viewport().setCursor(Qt.CursorShape.CrossCursor)
-            self.grid_item.setFlag(
-                QGraphicsObject.GraphicsItemFlag.ItemIsMovable, False
-            )
+            self.grid_item.setFlag(QGraphicsObject.GraphicsItemFlag.ItemIsMovable, False)
+            # ATIVAR OVERLAY
+            self.eraser_overlay.setVisible(True)
+            self.eraser_overlay.setSize(self.eraser_size)
         else:
             self.btn_toggle_eraser.setText("Enable Eraser")
-            self.btn_toggle_eraser.setStyleSheet(
-                "background-color: #ff6b6b; font-weight: bold;"
-            )
+            self.btn_toggle_eraser.setStyleSheet("background-color: #ff6b6b; font-weight: bold")
             self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
             self.grid_item.setFlag(QGraphicsObject.GraphicsItemFlag.ItemIsMovable, True)
             self.last_eraser_point = None
+            # DESATIVAR OVERLAY
+            self.eraser_overlay.setVisible(False)
+
 
     def on_eraser_size_change(self, value):
         self.eraser_size = value
+        self.eraser_overlay.setSize(value)
+
 
     def view_mouse_press(self, event):
         modifiers = QApplication.keyboardModifiers()
@@ -3061,6 +2926,10 @@ class SliceWindow(QWidget):
             QGraphicsView.mousePressEvent(self.view, event)
 
     def view_mouse_move(self, event):
+        
+        if self.eraser_mode:
+            scenepos = self.view.mapToScene(event.pos())
+            self.eraser_overlay.updatePosition(scenepos)        
         
         
         if self.cut_size_mode and self.is_drawing_cut_rect and self.cut_start_pos:
@@ -3353,21 +3222,23 @@ class SliceWindow(QWidget):
                 self.btn_outline_color.setEnabled(True)
                 self.btn_apply_outline.setEnabled(True)
                 self.btn_erase_edges.setEnabled(True)
-                self.btn_apply_denoise.setEnabled(True)
-                self.btn_apply_upscale.setEnabled(True)
+
                 self.btn_apply_color.setEnabled(True)
                 self.btn_reset_color.setEnabled(True)
                 self.chk_enable_fine_grid.setEnabled(True)
                 self.btn_cut_size.setEnabled(True)
+                self.btn_apply_pixel_snap.setEnabled(True)
             # Rotate Fine
                 self.btn_apply_rotate_fine.setEnabled(True)
                 self.slider_rotate_fine.setEnabled(True)
                 self.spin_rotate_fine.setEnabled(True)
                 
-
                 # Onde você habilita os outros botões:
                 if REMBG_AVAILABLE:  # ← Use a variável global
                     self.btn_remove_bg_ai.setEnabled(True)
+
+                # Habilita botões de upscale/denoise
+                self.update_upscale_button_state()
 
                 # Cria o layer principal
                 self.add_main_layer()
@@ -3430,17 +3301,12 @@ class SliceWindow(QWidget):
         self.btn_outline_color.setEnabled(True)
         self.btn_apply_outline.setEnabled(True)
         self.btn_erase_edges.setEnabled(True)
-        self.btn_apply_denoise.setEnabled(True)
-        self.btn_apply_upscale.setEnabled(True)
+
         self.btn_apply_color.setEnabled(True)
         self.btn_reset_color.setEnabled(True)
         self.chk_enable_fine_grid.setEnabled(True)
         self.btn_cut_size.setEnabled(True)
-            # Rotate Fine
-        self.btn_apply_rotate_fine.setEnabled(True)
-        self.slider_rotate_fine.setEnabled(True)
-        self.spin_rotate_fine.setEnabled(True)
-        
+        self.btn_apply_pixel_snap.setEnabled(True)
 
         # IA bg remover depende de REMBG_AVAILABLE
         if REMBG_AVAILABLE:
@@ -3581,9 +3447,9 @@ class SliceWindow(QWidget):
             self.current_image_pil = edges_rgba
             self.update_canvas_image()
 
-            QMessageBox.information(
-                self, "Edge Detection", "Bordas detectadas com sucesso!"
-            )
+            # QMessageBox.information(
+                # self, "Edge Detection", "Bordas detectadas com sucesso!"
+            # )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Erro ao detectar bordas: {str(e)}")
@@ -3595,6 +3461,9 @@ class SliceWindow(QWidget):
         self.save_state()
 
         try:
+            import numpy as np
+            from scipy.ndimage import distance_transform_edt
+
             thickness = self.spin_outline_thickness.value()
             feathering = self.spin_outline_feathering.value()
 
@@ -3605,49 +3474,79 @@ class SliceWindow(QWidget):
 
             w, h = self.current_image_pil.size
 
-            outline_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-
             if self.current_image_pil.mode == "RGBA":
                 alpha_mask = self.current_image_pil.split()[3]
             else:
                 alpha_mask = Image.new("L", (w, h), 255)
 
-            from PIL import ImageFilter
+            # Convert alpha to binary: opaque (True) vs transparent (False)
+            alpha_arr = np.array(alpha_mask, dtype=np.float64)
+            opaque = alpha_arr > 128
 
-            expanded_mask = alpha_mask.copy()
-            for _ in range(thickness):
-                expanded_mask = expanded_mask.filter(ImageFilter.MaxFilter(3))
+            # Distance from each TRANSPARENT pixel to the nearest OPAQUE pixel
+            # distance_transform_edt computes distance from each False pixel 
+            # to nearest True pixel when we invert
+            transparent = ~opaque
+            dist_from_opaque = distance_transform_edt(transparent)
 
-            if feathering > 0:
-                blur_amount = (feathering / 100.0) * thickness
-                expanded_mask = expanded_mask.filter(
-                    ImageFilter.GaussianBlur(radius=blur_amount)
-                )
+            # Distance from each OPAQUE pixel to the nearest TRANSPARENT pixel
+            # (needed to remove the outline from inside the sprite)
+            dist_from_transparent = distance_transform_edt(opaque)
 
+            if feathering == 0:
+                # Sharp outline: pixels within 'thickness' distance from
+                # the opaque region boundary, but only on the outside
+                outline_mask_arr = np.zeros((h, w), dtype=np.uint8)
+                # Outside pixels that are within thickness distance of the sprite
+                outside_near = (dist_from_opaque > 0) & (dist_from_opaque <= thickness)
+                outline_mask_arr[outside_near] = 255
+
+                # For sub-pixel: anti-alias the boundary pixel
+                # Pixels right at the edge get partial alpha
+                boundary = (dist_from_opaque > thickness) & (dist_from_opaque <= thickness + 1.0)
+                if np.any(boundary):
+                    # Fractional coverage: 1.0 at dist==thickness, 0.0 at dist==thickness+1
+                    frac = 1.0 - (dist_from_opaque[boundary] - thickness)
+                    outline_mask_arr[boundary] = (frac * 255).astype(np.uint8)
+
+            else:
+                # Feathered outline with smooth falloff
+                outline_mask_arr = np.zeros((h, w), dtype=np.float64)
+                
+                # Base outline region
+                outside_near = (dist_from_opaque > 0) & (dist_from_opaque <= thickness)
+                outline_mask_arr[outside_near] = 255.0
+
+                # Anti-alias the outer boundary
+                boundary = (dist_from_opaque > thickness) & (dist_from_opaque <= thickness + 1.0)
+                if np.any(boundary):
+                    frac = 1.0 - (dist_from_opaque[boundary] - thickness)
+                    outline_mask_arr[boundary] = frac * 255.0
+
+                # Apply feathering as gaussian blur on the mask
+                from PIL import ImageFilter
+                feather_img = Image.fromarray(outline_mask_arr.astype(np.uint8), mode="L")
+                blur_amount = (feathering / 100.0) * max(thickness, 0.5)
+                if blur_amount > 0:
+                    feather_img = feather_img.filter(
+                        ImageFilter.GaussianBlur(radius=blur_amount)
+                    )
+                outline_mask_arr = np.array(feather_img, dtype=np.uint8)
+
+            expanded_mask = Image.fromarray(outline_mask_arr, mode="L")
+
+            # Create the colored outline layer
+            outline_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             outline_color_layer = Image.new("RGBA", (w, h), (r, g, b, a))
-
             outline_layer.paste(outline_color_layer, (0, 0), expanded_mask)
 
-            outline_pixels = outline_layer.load()
-            alpha_pixels = alpha_mask.load()
-
-            for y in range(h):
-                for x in range(w):
-                    if alpha_pixels[x, y] > 128:
-                        outline_pixels[x, y] = (0, 0, 0, 0)
-
+            # Composite: outline behind, then original on top
             result = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             result.paste(outline_layer, (0, 0), outline_layer)
             result.paste(self.current_image_pil, (0, 0), self.current_image_pil)
 
             self.current_image_pil = result
             self.update_canvas_image()
-
-            QMessageBox.information(
-                self,
-                "Outline Applied",
-                f"Outline de {thickness}px aplicado com sucesso!",
-            )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Erro ao aplicar outline: {str(e)}")
@@ -3659,6 +3558,9 @@ class SliceWindow(QWidget):
         self.save_state()
 
         try:
+            import numpy as np
+            from scipy.ndimage import distance_transform_edt
+
             distance = self.spin_edge_eraser_distance.value()
             feathering = self.spin_edge_eraser_feathering.value()
 
@@ -3670,23 +3572,67 @@ class SliceWindow(QWidget):
                 self.current_image_pil = self.current_image_pil.convert("RGBA")
                 alpha = self.current_image_pil.split()[3]
 
-            eroded_mask = alpha.copy()
-            for _ in range(distance):
-                eroded_mask = eroded_mask.filter(ImageFilter.MinFilter(3))
+            # Convert alpha to binary
+            alpha_arr = np.array(alpha, dtype=np.float64)
+            opaque = alpha_arr > 128
 
-            if feathering > 0:
-                blur_amount = (feathering / 100.0) * distance
-                eroded_mask = eroded_mask.filter(
-                    ImageFilter.GaussianBlur(radius=blur_amount)
-                )
+            # Distance from each OPAQUE pixel to nearest TRANSPARENT pixel
+            # This tells us how far inside the sprite each pixel is
+            dist_from_edge = distance_transform_edt(opaque)
 
+            if feathering == 0:
+                # Sharp erosion: remove pixels within 'distance' of the edge
+                eroded_arr = np.zeros((h, w), dtype=np.uint8)
+
+                # Keep only pixels deeper inside than 'distance'
+                deep_inside = dist_from_edge > distance
+                eroded_arr[deep_inside] = 255
+
+                # Anti-alias the boundary for sub-pixel precision
+                boundary = (dist_from_edge > (distance - 1.0)) & (dist_from_edge <= distance)
+                if np.any(boundary):
+                    # Fractional coverage: 0.0 at dist==distance, 1.0 at dist==distance-1
+                    frac = dist_from_edge[boundary] - (distance - 1.0)
+                    # Clamp to ensure we don't exceed the original alpha
+                    frac = np.clip(frac, 0.0, 1.0)
+                    eroded_arr[boundary] = (frac * 255).astype(np.uint8)
+
+                # Preserve original alpha for pixels that survive (don't make
+                # semi-transparent pixels opaque)
+                orig_arr = np.array(alpha, dtype=np.uint8)
+                eroded_arr = np.minimum(eroded_arr, orig_arr)
+
+            else:
+                # Feathered erosion with smooth falloff
+                eroded_arr = np.zeros((h, w), dtype=np.float64)
+
+                deep_inside = dist_from_edge > distance
+                eroded_arr[deep_inside] = 255.0
+
+                boundary = (dist_from_edge > (distance - 1.0)) & (dist_from_edge <= distance)
+                if np.any(boundary):
+                    frac = dist_from_edge[boundary] - (distance - 1.0)
+                    frac = np.clip(frac, 0.0, 1.0)
+                    eroded_arr[boundary] = frac * 255.0
+
+                # Apply feathering as gaussian blur
+                from PIL import ImageFilter
+                feather_img = Image.fromarray(eroded_arr.astype(np.uint8), mode="L")
+                blur_amount = (feathering / 100.0) * max(distance, 0.5)
+                if blur_amount > 0:
+                    feather_img = feather_img.filter(
+                        ImageFilter.GaussianBlur(radius=blur_amount)
+                    )
+                eroded_arr = np.array(feather_img, dtype=np.uint8)
+
+                # Preserve original alpha
+                orig_arr = np.array(alpha, dtype=np.uint8)
+                eroded_arr = np.minimum(eroded_arr, orig_arr)
+
+            eroded_mask = Image.fromarray(eroded_arr.astype(np.uint8), mode="L")
             self.current_image_pil.putalpha(eroded_mask)
 
             self.update_canvas_image()
-
-            QMessageBox.information(
-                self, "Edge Eraser", f"Bordas apagadas em {distance}px!"
-            )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Erro ao apagar bordas: {str(e)}")
@@ -3776,6 +3722,86 @@ class SliceWindow(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Resize Error", str(e))
+
+    def apply_pixel_snap(self):
+        """
+        Aplica pixel snapping na imagem atual para converter imagens de IA
+        em pixel art estilo Tibia. Pipeline:
+        1. Posterizar cores (reduz gradientes suaves)
+        2. Quantizar paleta (K-means para limitar cores)
+        3. Snap alpha (binariza para bordas 100% nítidas)
+        """
+        if not self.current_image_pil:
+            return
+
+        self.save_state()
+
+        try:
+            import numpy as np
+
+            img = self.current_image_pil.copy()
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+
+            img_array = np.array(img)
+            rgb = img_array[:, :, :3]
+            alpha = img_array[:, :, 3]
+
+            # Passo 1: Posterizar
+            if self.chk_snap_posterize.isChecked():
+                levels = self.spin_snap_posterize.value()
+                if levels < 256:
+                    divisor = 256.0 / levels
+                    rgb = (np.floor(rgb.astype(np.float32) / divisor) * divisor).astype(np.uint8)
+
+            # Passo 2: Quantizar paleta (K-means)
+            if self.chk_snap_quantize.isChecked():
+                import cv2 as cv
+                n_colors = self.spin_snap_colors.value()
+                h, w = rgb.shape[:2]
+                pixels = rgb.reshape(-1, 3).astype(np.float32)
+
+                criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+                _, labels, centers = cv.kmeans(
+                    pixels, n_colors, None, criteria,
+                    attempts=3, flags=cv.KMEANS_PP_CENTERS
+                )
+                centers = centers.astype(np.uint8)
+                rgb = centers[labels.flatten()].reshape(h, w, 3)
+
+            # Passo 3: Snap alpha (bordas duras)
+            if self.chk_snap_alpha.isChecked():
+                alpha = np.where(alpha > 127, 255, 0).astype(np.uint8)
+
+            # Recombinar
+            result = np.dstack([rgb, alpha])
+            self.current_image_pil = Image.fromarray(result, "RGBA")
+            self.update_canvas_image()
+
+            # Conta cores únicas
+            mask = alpha > 0
+            visible_pixels = rgb[mask]
+            if len(visible_pixels) > 0:
+                unique_colors = len(np.unique(visible_pixels.reshape(-1, 3), axis=0))
+            else:
+                unique_colors = 0
+
+            QMessageBox.information(
+                self,
+                "Pixel Snap Applied",
+                f"Pixel snap aplicado!\n"
+                f"Cores únicas: {unique_colors}\n"
+                f"Tamanho: {self.current_image_pil.width}x{self.current_image_pil.height}px"
+            )
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            QMessageBox.critical(
+                self, "Pixel Snap Error",
+                f"Erro ao aplicar pixel snap: {str(e)}\n\n{error_details}"
+            )
+
 
     def reset_to_original(self):
         if not self.original_image_pil:
@@ -3947,6 +3973,7 @@ class SliceWindow(QWidget):
 
         if self.list_widget.count() > 0:
             self.btn_export.setEnabled(True)
+            self.btn_import.setEnabled(True)            
 
     def add_sprite_to_list(self, pil_image):
         self.sliced_images.append(pil_image)
@@ -4150,6 +4177,243 @@ class SliceWindow(QWidget):
         
         self.slider_rotate_fine.blockSignals(False)
         self.spin_rotate_fine.blockSignals(False)
+
+    def on_upscale_method_changed(self, method):
+        is_waifu = method == "Waifu2x"
+        self.lbl_upscale_noise.setEnabled(is_waifu)
+        self.combo_upscale_noise.setEnabled(is_waifu)
+        self.update_upscale_button_state()
+
+    def update_upscale_button_state(self):
+        method = self.combo_upscale_method.currentText()
+        has_image = self.current_image_pil is not None
+
+        # Denoise button (only for Waifu2x)
+        self.btn_apply_denoise.setEnabled(has_image and WAIFU_AVAILABLE)
+        
+        if method == "Waifu2x":
+            self.btn_apply_upscale.setEnabled(has_image and WAIFU_AVAILABLE)
+            if not WAIFU_AVAILABLE:
+                self.btn_apply_upscale.setToolTip(f"upscale2.exe não encontrado em:\n{WAIFU_EXE}")
+                self.lbl_upscale_status.setText(f"⚠️ upscale2.exe não encontrado em:\n{WAIFU_EXE}")
+            else:
+                self.btn_apply_upscale.setToolTip("")
+                self.lbl_upscale_status.setText("")
+        elif method == "Real-ESRGAN":
+            self.btn_apply_upscale.setEnabled(has_image and ESRGAN_AVAILABLE)
+            if not ESRGAN_AVAILABLE:
+                self.btn_apply_upscale.setToolTip("realesrgan ou basicsr/torch não instalados no Python.")
+                self.lbl_upscale_status.setText("⚠️ realesrgan ou basicsr/torch não instalados no Python.")
+            else:
+                self.btn_apply_upscale.setToolTip("")
+                self.lbl_upscale_status.setText("")
+
+    def apply_denoise(self):
+        """Aplica denoise na imagem atual usando waifu2x (upscale2.exe)"""
+        if not self.current_image_pil:
+            return
+
+        if not WAIFU_AVAILABLE:
+            QMessageBox.warning(self, "Waifu2x", f"upscale2.exe não encontrado em:\n{WAIFU_EXE}")
+            return
+
+        noise_level = self.combo_denoise_level.currentText()
+
+        self.lbl_upscale_status.setText("⏳ Aplicando denoise...")
+        self.btn_apply_denoise.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                input_path = os.path.join(tmp_dir, "input.png")
+                output_path = os.path.join(tmp_dir, "output.png")
+
+                # Salva imagem atual para o arquivo temporário
+                self.current_image_pil.save(input_path)
+
+                cmd = [
+                    WAIFU_EXE,
+                    "-i", input_path,
+                    "-o", output_path,
+                    "-s", "1",
+                    "-m", "noise",
+                    "-n", noise_level,
+                    "-p", "cpu"
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if os.path.isfile(output_path):
+                    self.save_state()
+                    result_img = Image.open(output_path).convert("RGBA")
+                    self.current_image_pil = result_img
+                    self.update_canvas_image()
+                    self.lbl_upscale_status.setText(f"✅ Denoise (nível {noise_level}) aplicado!")
+                else:
+                    stderr = result.stderr.strip() if result.stderr else "Erro desconhecido"
+                    self.lbl_upscale_status.setText(f"❌ Falha: {stderr[:100]}")
+                    QMessageBox.critical(self, "Erro", f"upscale2.exe falhou:\n{stderr}")
+
+        except Exception as e:
+            self.lbl_upscale_status.setText(f"❌ Erro: {str(e)[:80]}")
+            QMessageBox.critical(self, "Erro", str(e))
+        finally:
+            self.update_upscale_button_state()
+
+    def apply_ai_upscale(self):
+        """Aplica AI upscale na imagem atual"""
+        if not self.current_image_pil:
+            return
+
+        method = self.combo_upscale_method.currentText()
+
+        if method == "Waifu2x":
+            if not WAIFU_AVAILABLE:
+                QMessageBox.warning(self, "Waifu2x", f"upscale2.exe não encontrado em:\n{WAIFU_EXE}")
+                return
+
+            factor_text = self.combo_upscale_factor.currentText()  # "2x" ou "4x"
+            factor = factor_text.replace("x", "")  # "2" ou "4"
+            noise_level = self.combo_upscale_noise.currentText()
+            keep_original = self.chk_keep_original_size.isChecked()
+            original_size = self.current_image_pil.size
+
+            self.lbl_upscale_status.setText(f"⏳ Aplicando upscale {factor_text}...")
+            self.btn_apply_upscale.setEnabled(False)
+            QApplication.processEvents()
+
+            try:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    input_path = os.path.join(tmp_dir, "input.png")
+                    output_path = os.path.join(tmp_dir, "output.png")
+
+                    # Salva imagem atual
+                    self.current_image_pil.save(input_path)
+
+                    cmd = [
+                        WAIFU_EXE,
+                        "-i", input_path,
+                        "-o", output_path,
+                        "-s", factor,
+                        "-m", "noise_scale",
+                        "-n", noise_level,
+                        "-p", "cpu"
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+
+                    if os.path.isfile(output_path):
+                        self.save_state()
+                        result_img = Image.open(output_path).convert("RGBA")
+
+                        if keep_original:
+                            # Redimensiona de volta para o tamanho original
+                            result_img = result_img.resize(original_size, Image.LANCZOS)
+                            status_msg = f"✅ Upscale {factor_text} + volta para {original_size[0]}x{original_size[1]}"
+                        else:
+                            status_msg = f"✅ Upscale {factor_text} aplicado! Novo tamanho: {result_img.width}x{result_img.height}"
+
+                        self.current_image_pil = result_img
+
+                        # Atualiza os spinboxes de resize
+                        self.spin_resize_width.blockSignals(True)
+                        self.spin_resize_height.blockSignals(True)
+                        self.spin_resize_width.setValue(result_img.width)
+                        self.spin_resize_height.setValue(result_img.height)
+                        self.spin_resize_width.blockSignals(False)
+                        self.spin_resize_height.blockSignals(False)
+
+                        self.update_canvas_image()
+                        self.lbl_upscale_status.setText(status_msg)
+                    else:
+                        stderr = result.stderr.strip() if result.stderr else "Erro desconhecido"
+                        self.lbl_upscale_status.setText(f"❌ Falha: {stderr[:100]}")
+                        QMessageBox.critical(self, "Erro", f"upscale2.exe falhou:\n{stderr}")
+
+            except Exception as e:
+                self.lbl_upscale_status.setText(f"❌ Erro: {str(e)[:80]}")
+                QMessageBox.critical(self, "Erro", str(e))
+            finally:
+                self.update_upscale_button_state()
+
+        elif method == "Real-ESRGAN":
+            if not ESRGAN_AVAILABLE:
+                QMessageBox.warning(self, "Real-ESRGAN", "Real-ESRGAN não está disponível.")
+                return
+
+            factor_text = self.combo_upscale_factor.currentText()  # "2x" ou "4x"
+            factor = int(factor_text.replace("x", ""))  # 2 ou 4
+            keep_original = self.chk_keep_original_size.isChecked()
+            original_size = self.current_image_pil.size
+
+            self.lbl_upscale_status.setText(f"⏳ Aplicando Real-ESRGAN {factor_text}...")
+            self.btn_apply_upscale.setEnabled(False)
+            QApplication.processEvents()
+
+            try:
+                # 1. Preparar imagem
+                img_rgba = self.current_image_pil.copy()
+                alpha = img_rgba.split()[3] if len(img_rgba.split()) == 4 else None
+                rgb_img = img_rgba.convert("RGB")
+
+                # Converter para array BGR numpy
+                img_np = np.array(rgb_img)
+                img_bgr = img_np[:, :, ::-1]
+
+                # 2. Configurar o upsampler
+                model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model_path = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+
+                upsampler = RealESRGANer(
+                    scale=4,
+                    model_path=model_path,
+                    model=model,
+                    tile=0,
+                    tile_pad=10,
+                    pre_pad=0,
+                    half=False,
+                    device=device
+                )
+
+                # 3. Executar o upscale
+                output_bgr, _ = upsampler.enhance(img_bgr, outscale=factor)
+
+                # 4. Reconstrutor de imagem RGBA
+                output_rgb_np = output_bgr[:, :, ::-1]
+                output_rgb_pil = Image.fromarray(output_rgb_np)
+
+                if alpha:
+                    new_w, new_h = output_rgb_pil.size
+                    alpha_resized = alpha.resize((new_w, new_h), Image.Resampling.NEAREST)
+                    result_img = Image.merge("RGBA", (*output_rgb_pil.split(), alpha_resized))
+                else:
+                    result_img = output_rgb_pil.convert("RGBA")
+
+                self.save_state()
+
+                if keep_original:
+                    result_img = result_img.resize(original_size, Image.Resampling.LANCZOS)
+                    status_msg = f"✅ Real-ESRGAN {factor_text} + volta para {original_size[0]}x{original_size[1]}"
+                else:
+                    status_msg = f"✅ Real-ESRGAN {factor_text} aplicado! Novo tamanho: {result_img.width}x{result_img.height}"
+
+                self.current_image_pil = result_img
+
+                # Atualiza os spinboxes de resize
+                self.spin_resize_width.blockSignals(True)
+                self.spin_resize_height.blockSignals(True)
+                self.spin_resize_width.setValue(result_img.width)
+                self.spin_resize_height.setValue(result_img.height)
+                self.spin_resize_width.blockSignals(False)
+                self.spin_resize_height.blockSignals(False)
+
+                self.update_canvas_image()
+                self.lbl_upscale_status.setText(status_msg)
+
+            except Exception as e:
+                self.lbl_upscale_status.setText(f"❌ Erro: {str(e)[:80]}")
+                QMessageBox.critical(self, "Erro", str(e))
+            finally:
+                self.update_upscale_button_state()
 
 
 
