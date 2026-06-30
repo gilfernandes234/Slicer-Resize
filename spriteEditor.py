@@ -229,12 +229,6 @@ else:
     _base_path = os.path.dirname(os.path.abspath(__file__))
 
 try:
-    from rembg import remove
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
-
-try:
     import numpy as np
     import torch
     from realesrgan import RealESRGANer
@@ -422,17 +416,12 @@ class EraserOverlay(QGraphicsObject):
         
         radius = self.size / 2
         
-        # Círculo externo (borda)
-        pen = QPen(QColor(255, 100, 100, 200), 2, Qt.PenStyle.SolidLine)
+        # Borda simples (removemos a mira e o preenchimento para não borrar pincéis pequenos)
+        pen = QPen(QColor(255, 100, 100, 200), 1, Qt.PenStyle.SolidLine)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(0, 0), radius, radius)
-        
-        # Cruz central para indicar o centro exato
-        cross_size = 3
-        painter.drawLine(-cross_size, 0, cross_size, 0)
-        painter.drawLine(0, -cross_size, 0, cross_size)
     
     def setSize(self, size):
         self.prepareGeometryChange()
@@ -470,7 +459,7 @@ class ZoomableGraphicsView(QGraphicsView):
                 factor = zoom_out_factor
                 self.zoom_factor *= zoom_out_factor
 
-            if 0.1 <= self.zoom_factor <= 5.0:
+            if 0.1 <= self.zoom_factor <= 50.0:
                 self.scale(factor, factor)
 
                 new_pos = self.mapToScene(event.position().toPoint())
@@ -576,13 +565,32 @@ class SliceWindow(QWidget):
         btn_open.clicked.connect(self.open_image)
         tb_layout.addWidget(btn_open)
 
-        # Novo botão: Export Project (exporta a imagem atual inteira, sem slices)
         btn_export_project = QPushButton("Export Imagem Completa ")
         btn_export_project.setStyleSheet(
             "background-color: #28a745; padding: 5px; font-weight: bold;"
         )
         btn_export_project.clicked.connect(self.export_full_project)
         tb_layout.addWidget(btn_export_project)
+
+        tb_layout.addSpacing(20)
+
+        lbl_zoom_title = QLabel("Zoom:")
+        lbl_zoom_title.setStyleSheet("color: white; font-weight: bold;")
+        tb_layout.addWidget(lbl_zoom_title)
+
+        self.slider_zoom = QSlider(Qt.Orientation.Horizontal)
+        self.slider_zoom.setRange(10, 5000)
+        self.slider_zoom.setValue(100)
+        self.slider_zoom.setFixedWidth(150)
+        self.slider_zoom.setToolTip("Ctrl+Scroll também altera o Zoom")
+        self.slider_zoom.valueChanged.connect(self.on_zoom_change)
+        tb_layout.addWidget(self.slider_zoom)
+
+        self.lbl_zoom_val = QLabel("100%")
+        self.lbl_zoom_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_zoom_val.setFixedWidth(50)
+        self.lbl_zoom_val.setStyleSheet("color: white;")
+        tb_layout.addWidget(self.lbl_zoom_val)
 
         tb_layout.addStretch()
 
@@ -749,19 +757,8 @@ class SliceWindow(QWidget):
         grp_pixel_snap.setLayout(pixel_snap_layout)
         tab_resize_layout.addWidget(grp_pixel_snap)
 
-        grp_edges = QGroupBox("Edge Detection & Outline")
+        grp_edges = QGroupBox("Outline")
         edges_layout = QGridLayout()
-
-   
-        edges_layout.addWidget(QLabel("Edge Detection:"), 0, 0, 1, 2)
-
-        self.btn_detect_edges = QPushButton("Detect Edges")
-        self.btn_detect_edges.setStyleSheet(
-            "background-color: #6c757d; font-weight: bold;"
-        )
-        self.btn_detect_edges.clicked.connect(self.detect_edges)
-        self.btn_detect_edges.setEnabled(False)
-        edges_layout.addWidget(self.btn_detect_edges, 1, 0, 1, 2)
 
         # Outline Tool
         edges_layout.addWidget(QLabel("Outline:"), 2, 0, 1, 2)
@@ -838,6 +835,34 @@ class SliceWindow(QWidget):
         grp_edges.setLayout(edges_layout)
         tab_resize_layout.addWidget(grp_edges)
 
+        grp_sharpen = QGroupBox("Sharpening")
+        sharpen_layout = QGridLayout()
+
+        sharpen_layout.addWidget(QLabel("Radius:"), 0, 0)
+        self.spin_sharpen_radius = QDoubleSpinBox()
+        self.spin_sharpen_radius.setRange(0.1, 10.0)
+        self.spin_sharpen_radius.setValue(2.0)
+        self.spin_sharpen_radius.setSingleStep(0.1)
+        self.spin_sharpen_radius.setToolTip("Raio do Unsharp Mask")
+        sharpen_layout.addWidget(self.spin_sharpen_radius, 0, 1)
+
+        sharpen_layout.addWidget(QLabel("Percent:"), 1, 0)
+        self.spin_sharpen_percent = QSpinBox()
+        self.spin_sharpen_percent.setRange(1, 500)
+        self.spin_sharpen_percent.setValue(150)
+        self.spin_sharpen_percent.setSuffix("%")
+        self.spin_sharpen_percent.setToolTip("Força da nitidez")
+        sharpen_layout.addWidget(self.spin_sharpen_percent, 1, 1)
+
+        self.btn_apply_sharpen = QPushButton("Apply Sharpen")
+        self.btn_apply_sharpen.setStyleSheet("background-color: #007acc; font-weight: bold; color: white;")
+        self.btn_apply_sharpen.clicked.connect(self.apply_sharpen)
+        self.btn_apply_sharpen.setEnabled(False)
+        sharpen_layout.addWidget(self.btn_apply_sharpen, 2, 0, 1, 2)
+
+        grp_sharpen.setLayout(sharpen_layout)
+        tab_resize_layout.addWidget(grp_sharpen)
+
         tab_resize_layout.addStretch()
 
         tab_transparency = QWidget()
@@ -856,25 +881,32 @@ class SliceWindow(QWidget):
 
         transparency_layout.addWidget(QLabel("Tolerance:"), 1, 0)
         self.spin_tolerance = QSpinBox()
-        self.spin_tolerance.setRange(0, 255)
-        self.spin_tolerance.setValue(0)
+        self.spin_tolerance.setRange(0, 442)
+        self.spin_tolerance.setValue(10)
         self.spin_tolerance.setToolTip(
             "0 = cor exata, valores maiores = cores similares"
         )
         transparency_layout.addWidget(self.spin_tolerance, 1, 1)
 
+        transparency_layout.addWidget(QLabel("Smoothness:"), 2, 0)
+        self.spin_smoothness = QSpinBox()
+        self.spin_smoothness.setRange(0, 200)
+        self.spin_smoothness.setValue(10)
+        self.spin_smoothness.setToolTip("Suaviza as bordas ao remover a cor")
+        transparency_layout.addWidget(self.spin_smoothness, 2, 1)
+
         self.btn_pick_color = QPushButton("Pick Color from Image")
         self.btn_pick_color.setStyleSheet("background-color: #555;")
         self.btn_pick_color.clicked.connect(self.enable_color_picker)
         self.btn_pick_color.setEnabled(False)
-        transparency_layout.addWidget(self.btn_pick_color, 2, 0, 1, 2)
+        transparency_layout.addWidget(self.btn_pick_color, 3, 0, 1, 2)
 
         self.lbl_preview_color = QLabel()
         self.lbl_preview_color.setFixedHeight(30)
         self.lbl_preview_color.setStyleSheet(
             "background-color: #dcff73; border: 1px solid #222;"
         )
-        transparency_layout.addWidget(self.lbl_preview_color, 3, 0, 1, 2)
+        transparency_layout.addWidget(self.lbl_preview_color, 4, 0, 1, 2)
 
         self.btn_remove_color = QPushButton("Remove Color")
         self.btn_remove_color.setStyleSheet(
@@ -882,24 +914,26 @@ class SliceWindow(QWidget):
         )
         self.btn_remove_color.clicked.connect(self.remove_color_to_transparent)
         self.btn_remove_color.setEnabled(False)
-        transparency_layout.addWidget(self.btn_remove_color, 4, 0, 1, 2)
+        transparency_layout.addWidget(self.btn_remove_color, 5, 0, 1, 2)
 
         grp_transparency.setLayout(transparency_layout)
         tab_transparency_layout.addWidget(grp_transparency)
 
-        self.btn_remove_bg_ai = QPushButton("Remove Background (AI)")
-        self.btn_remove_bg_ai.setStyleSheet(
-            "background-color: #9c27b0; font-weight: bold; color: white;"
+        transparency_layout.addWidget(QLabel("Max Opacity to Remove (%):"), 7, 0)
+        self.spin_remove_opacity = QSpinBox()
+        self.spin_remove_opacity.setRange(0, 100)
+        self.spin_remove_opacity.setValue(95)
+        self.spin_remove_opacity.setSuffix("%")
+        self.spin_remove_opacity.setToolTip("Remove todos os pixels com opacidade menor ou igual ao valor")
+        transparency_layout.addWidget(self.spin_remove_opacity, 7, 1)
+
+        self.btn_remove_by_opacity = QPushButton("Remove by Opacity")
+        self.btn_remove_by_opacity.setStyleSheet(
+            "background-color: #dc3545; font-weight: bold; color: white;"
         )
-        self.btn_remove_bg_ai.clicked.connect(self.remove_background_ai)
-        self.btn_remove_bg_ai.setEnabled(False)
-
-        if not REMBG_AVAILABLE:  # ← Use a variável global
-            self.btn_remove_bg_ai.setToolTip("rembg não instalado")
-        else:
-            self.btn_remove_bg_ai.setToolTip("Remove background usando IA (U2Net)")
-
-        transparency_layout.addWidget(self.btn_remove_bg_ai, 5, 0, 1, 2)
+        self.btn_remove_by_opacity.clicked.connect(self.remove_by_opacity)
+        self.btn_remove_by_opacity.setEnabled(False)
+        transparency_layout.addWidget(self.btn_remove_by_opacity, 8, 0, 1, 2)
 
         # GRUPO 2: Color Adjustments (NOVO)
         grp_color_adjust = QGroupBox("Color Adjustments")
@@ -1351,19 +1385,6 @@ class SliceWindow(QWidget):
         self.tab_widget.addTab(tab_upscale, "Upscale")
 
         lp_layout.addWidget(self.tab_widget)
-
-        grp_zoom = QGroupBox("Zoom")
-        zoom_layout = QVBoxLayout()
-        self.slider_zoom = QSlider(Qt.Orientation.Horizontal)
-        self.slider_zoom.setRange(10, 500)
-        self.slider_zoom.setValue(100)
-        self.slider_zoom.valueChanged.connect(self.on_zoom_change)
-        zoom_layout.addWidget(self.slider_zoom)
-        self.lbl_zoom_val = QLabel("100% (Ctrl+Scroll)")
-        self.lbl_zoom_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zoom_layout.addWidget(self.lbl_zoom_val)
-        grp_zoom.setLayout(zoom_layout)
-        lp_layout.addWidget(grp_zoom)
 
         lp_layout.addStretch()
         content_layout.addWidget(left_panel)
@@ -2286,63 +2307,6 @@ class SliceWindow(QWidget):
                 item = self.layer_graphics_items[layer.id]
                 item.setPos(layer.x, layer.y)
                 item.setVisible(layer.visible)
-
-    def remove_background_ai(self):
-        if not self.current_image_pil:
-            return
-
-        if not REMBG_AVAILABLE:  # ← Use a variável global aqui
-            QMessageBox.critical(
-                self,
-                "Biblioteca Faltando",
-                "rembg não está instalado!\nInstale com: pip install rembg",
-            )
-            return
-
-        self.save_state()
-
-        try:
-            import io
-
-            from rembg import remove  # Importa aqui de novo (já foi importado no topo)
-
-            # Mostrar mensagem de progresso
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
-
-            # Converte PIL Image para bytes
-            img_byte_arr = io.BytesIO()
-            self.current_image_pil.save(img_byte_arr, format="PNG")
-            img_byte_arr = img_byte_arr.getvalue()
-
-            # Remove background
-            output_data = remove(img_byte_arr)
-
-            # Converte de volta para PIL Image
-            output_image = Image.open(io.BytesIO(output_data))
-
-            # Garante que está em RGBA
-            if output_image.mode != "RGBA":
-                output_image = output_image.convert("RGBA")
-
-            self.current_image_pil = output_image
-            self.update_canvas_image()
-
-            QApplication.restoreOverrideCursor()
-
-            QMessageBox.information(
-                self,
-                "Background Removed",
-                "Background removido automaticamente com sucesso usando IA!",
-            )
-
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Error", f"Erro ao remover background: {str(e)}")
-
-    
-
-
     def on_brightness_change(self, value):
         self.lbl_brightness.setText(str(value))
 
@@ -2531,7 +2495,7 @@ class SliceWindow(QWidget):
         if x < 0 or y < 0 or x >= w or y >= h:
             return
 
-        radius = self.paint_size // 2
+        size = max(1, self.paint_size)
 
         r, g, b, a = (
             self.paint_color.red(),
@@ -2543,49 +2507,56 @@ class SliceWindow(QWidget):
         brush_type = getattr(self, "brush_type", "Circle")
 
         if brush_type == "Circle":
-            self._paint_circle(x, y, radius, (r, g, b, a))
+            self._paint_circle(x, y, size, (r, g, b, a))
 
         elif brush_type == "Square":
-            self._paint_square(x, y, radius, (r, g, b, a))
+            self._paint_square(x, y, size, (r, g, b, a))
 
         elif brush_type == "Hard Pixel":
-            self._paint_hard_pixel(x, y, radius, (r, g, b, a))
+            self._paint_hard_pixel(x, y, size, (r, g, b, a))
 
         elif brush_type == "Spray":
-            self._paint_spray(x, y, radius, (r, g, b, a))
+            self._paint_spray(x, y, size, (r, g, b, a))
 
         elif brush_type == "Texture" and self.texture_brush_image is not None:
-            self._paint_texture(x, y, radius)
+            self._paint_texture(x, y, size)
 
         else:
             # fallback para o círculo atual
-            self._paint_circle(x, y, radius, (r, g, b, a))
+            self._paint_circle(x, y, size, (r, g, b, a))
 
         self.update_canvas_image()
 
-    def _paint_circle(self, x, y, radius, color_rgba):
+    def _paint_circle(self, x, y, size, color_rgba):
         from PIL import ImageDraw
 
         r, g, b, a = color_rgba
+        left = x - size // 2
+        top = y - size // 2
+        right = left + size - 1
+        bottom = top + size - 1
+
         if self.paint_feathering == 0:
             draw = ImageDraw.Draw(self.current_image_pil, "RGBA")
-            bbox = [x - radius, y - radius, x + radius, y + radius]
-            draw.ellipse(bbox, fill=(r, g, b, a))
+            if size == 1:
+                draw.point((x, y), fill=(r, g, b, a))
+            else:
+                draw.ellipse([left, top, right, bottom], fill=(r, g, b, a))
         else:
-            # Reusar exatamente sua lógica atual de feathering aqui
-            blur_radius = int((self.paint_feathering / 100.0) * radius)
+            blur_radius = int((self.paint_feathering / 100.0) * (size / 2))
             margin = blur_radius + 10
-            temp_size = (radius * 2 + margin * 2, radius * 2 + margin * 2)
+            
+            temp_w = size + margin * 2
+            temp_h = size + margin * 2
 
-            color_layer = Image.new("RGB", temp_size, (r, g, b))
-            mask = Image.new("L", temp_size, 0)
+            color_layer = Image.new("RGB", (temp_w, temp_h), (r, g, b))
+            mask = Image.new("L", (temp_w, temp_h), 0)
             mask_draw = ImageDraw.Draw(mask)
 
-            center = radius + margin
-            mask_draw.ellipse(
-                [center - radius, center - radius, center + radius, center + radius],
-                fill=a,
-            )
+            if size == 1:
+                mask_draw.point((margin, margin), fill=a)
+            else:
+                mask_draw.ellipse([margin, margin, margin + size - 1, margin + size - 1], fill=a)
 
             if blur_radius > 0:
                 mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -2593,47 +2564,35 @@ class SliceWindow(QWidget):
             color_layer = color_layer.convert("RGBA")
             color_layer.putalpha(mask)
 
-            paste_x = x - center
-            paste_y = y - center
+            paste_x = left - margin
+            paste_y = top - margin
 
             self.current_image_pil.alpha_composite(color_layer, (paste_x, paste_y))
 
-    def _paint_square(self, x, y, radius, color_rgba):
+    def _paint_square(self, x, y, size, color_rgba):
         from PIL import ImageDraw
 
         r, g, b, a = color_rgba
         draw = ImageDraw.Draw(self.current_image_pil, "RGBA")
 
-        left = x - radius
-        top = y - radius
-        right = x + radius
-        bottom = y + radius
+        left = x - size // 2
+        top = y - size // 2
+        right = left + size - 1
+        bottom = top + size - 1
 
         if self.paint_feathering == 0:
             draw.rectangle([left, top, right, bottom], fill=(r, g, b, a))
         else:
-            # Versão simples: igual ao círculo, mas com mask retangular
-            blur_radius = int((self.paint_feathering / 100.0) * radius)
+            blur_radius = int((self.paint_feathering / 100.0) * (size / 2))
             margin = blur_radius + 10
-            w = radius * 2 + margin * 2
-            h = radius * 2 + margin * 2
+            temp_w = size + margin * 2
+            temp_h = size + margin * 2
 
-            color_layer = Image.new("RGB", (w, h), (r, g, b))
-            mask = Image.new("L", (w, h), 0)
+            color_layer = Image.new("RGB", (temp_w, temp_h), (r, g, b))
+            mask = Image.new("L", (temp_w, temp_h), 0)
             mask_draw = ImageDraw.Draw(mask)
 
-            center_x = w // 2
-            center_y = h // 2
-
-            mask_draw.rectangle(
-                [
-                    center_x - radius,
-                    center_y - radius,
-                    center_x + radius,
-                    center_y + radius,
-                ],
-                fill=a,
-            )
+            mask_draw.rectangle([margin, margin, margin + size - 1, margin + size - 1], fill=a)
 
             if blur_radius > 0:
                 mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -2641,28 +2600,30 @@ class SliceWindow(QWidget):
             color_layer = color_layer.convert("RGBA")
             color_layer.putalpha(mask)
 
-            paste_x = x - center_x
-            paste_y = y - center_y
+            paste_x = left - margin
+            paste_y = top - margin
 
             self.current_image_pil.alpha_composite(color_layer, (paste_x, paste_y))
 
-    def _paint_hard_pixel(self, x, y, radius, color_rgba):
+    def _paint_hard_pixel(self, x, y, size, color_rgba):
         # "Pixel" pode ser 1x1 ou NxN, sem feather, alinhado à grade de pixels
         from PIL import ImageDraw
 
         r, g, b, a = color_rgba
-        size = max(1, self.paint_size)  # usa paint_size como bloco
 
         left = x - size // 2
         top = y - size // 2
-        right = left + size
-        bottom = top + size
+        right = left + size - 1
+        bottom = top + size - 1
 
         draw = ImageDraw.Draw(self.current_image_pil, "RGBA")
         draw.rectangle([left, top, right, bottom], fill=(r, g, b, a))
 
-    def _paint_spray(self, x, y, radius, color_rgba):
+    def _paint_spray(self, x, y, size, color_rgba):
         import random
+
+        radius = size / 2.0
+        if radius < 0.5: radius = 0.5
 
         r, g, b, a = color_rgba
         pixels = self.current_image_pil.load()
@@ -2671,7 +2632,7 @@ class SliceWindow(QWidget):
         density = getattr(self, "spray_density", 0.3)
 
         # Número de amostras proporcional à área e à densidade
-        samples = int((radius * radius * 3.14) * density)
+        samples = int(max(1, (radius * radius * 3.14) * density))
 
         for _ in range(samples):
             # ponto aleatório dentro do círculo
@@ -2686,7 +2647,7 @@ class SliceWindow(QWidget):
             if 0 <= px < w and 0 <= py < h:
                 pixels[px, py] = (r, g, b, a)
 
-    def _paint_texture(self, x, y, radius):
+    def _paint_texture(self, x, y, size):
         if not self.texture_brush_image:
             return
 
@@ -2764,7 +2725,7 @@ class SliceWindow(QWidget):
         super().keyPressEvent(event)
 
     def update_zoom_label(self, zoom_percentage):
-        self.lbl_zoom_val.setText(f"{zoom_percentage}% (Ctrl+Scroll)")
+        self.lbl_zoom_val.setText(f"{zoom_percentage}%")
 
         self.slider_zoom.blockSignals(True)
         self.slider_zoom.setValue(zoom_percentage)
@@ -2952,11 +2913,26 @@ class SliceWindow(QWidget):
             self.last_eraser_point = QPoint(int(scene_pos.x()), int(scene_pos.y()))
             self.erase_at_point(self.last_eraser_point)
 
-        elif self.paint_mode and event.button() == Qt.MouseButton.LeftButton:
-            self.save_state()
-            scene_pos = self.view.mapToScene(event.pos())
-            self.last_paint_point = QPoint(int(scene_pos.x()), int(scene_pos.y()))
-            self.paint_at_point(self.last_paint_point)
+        elif self.paint_mode:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.save_state()
+                scene_pos = self.view.mapToScene(event.pos())
+                self.last_paint_point = QPoint(int(scene_pos.x()), int(scene_pos.y()))
+                self.paint_at_point(self.last_paint_point)
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.save_state()
+                scene_pos = self.view.mapToScene(event.pos())
+                self.last_eraser_point = QPoint(int(scene_pos.x()), int(scene_pos.y()))
+                
+                old_size = self.eraser_size
+                old_feather = self.eraser_feathering
+                self.eraser_size = self.paint_size
+                self.eraser_feathering = self.paint_feathering
+                
+                self.erase_at_point(self.last_eraser_point)
+                
+                self.eraser_size = old_size
+                self.eraser_feathering = old_feather
 
         elif self.selection_mode and event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.view.mapToScene(event.pos())
@@ -3025,14 +3001,27 @@ class SliceWindow(QWidget):
             
            
 
-        elif self.paint_mode and event.buttons() & Qt.MouseButton.LeftButton:
+        elif self.paint_mode:
             scene_pos = self.view.mapToScene(event.pos())
             current_point = QPoint(int(scene_pos.x()), int(scene_pos.y()))
 
-            if self.last_paint_point:
-                self.paint_line(self.last_paint_point, current_point)
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                if self.last_paint_point:
+                    self.paint_line(self.last_paint_point, current_point)
+                self.last_paint_point = current_point
 
-            self.last_paint_point = current_point
+            elif event.buttons() & Qt.MouseButton.RightButton:
+                if self.last_eraser_point:
+                    old_size = self.eraser_size
+                    old_feather = self.eraser_feathering
+                    self.eraser_size = self.paint_size
+                    self.eraser_feathering = self.paint_feathering
+                    
+                    self.erase_line(self.last_eraser_point, current_point)
+                    
+                    self.eraser_size = old_size
+                    self.eraser_feathering = old_feather
+                self.last_eraser_point = current_point
 
         elif self.selection_mode:
             if self.is_moving_selection and event.buttons() & Qt.MouseButton.LeftButton:
@@ -3060,6 +3049,7 @@ class SliceWindow(QWidget):
 
         elif self.paint_mode:
             self.last_paint_point = None
+            self.last_eraser_point = None
 
         elif self.selection_mode:
             if self.is_moving_selection:
@@ -3204,46 +3194,53 @@ class SliceWindow(QWidget):
         if x < 0 or y < 0 or x >= w or y >= h:
             return
 
-        radius = self.eraser_size // 2
+        size = max(1, self.eraser_size)
+
+        left = x - size // 2
+        top = y - size // 2
+        right = left + size - 1
+        bottom = top + size - 1
 
         if self.eraser_feathering == 0:
             draw = ImageDraw.Draw(self.current_image_pil, "RGBA")
-            bbox = [x - radius, y - radius, x + radius, y + radius]
+            bbox = [left, top, right, bottom]
 
             temp = Image.new("RGBA", self.current_image_pil.size, (0, 0, 0, 0))
             temp_draw = ImageDraw.Draw(temp)
-            temp_draw.ellipse(bbox, fill=(0, 0, 0, 255))
+            if size == 1:
+                temp_draw.point((x, y), fill=(0, 0, 0, 255))
+            else:
+                temp_draw.ellipse(bbox, fill=(0, 0, 0, 255))
 
             mask = temp.split()[3]
 
             pixels = self.current_image_pil.load()
             mask_pixels = mask.load()
 
-            for py in range(max(0, y - radius), min(h, y + radius + 1)):
-                for px in range(max(0, x - radius), min(w, x + radius + 1)):
+            for py in range(max(0, top), min(h, bottom + 1)):
+                for px in range(max(0, left), min(w, right + 1)):
                     if mask_pixels[px, py] > 0:
                         pixels[px, py] = (0, 0, 0, 0)
         else:
-            blur_radius = int((self.eraser_feathering / 100.0) * radius)
+            blur_radius = int((self.eraser_feathering / 100.0) * (size / 2))
 
             margin = blur_radius + 10
-            temp_size = (radius * 2 + margin * 2, radius * 2 + margin * 2)
+            temp_w = size + margin * 2
+            temp_h = size + margin * 2
 
-            mask = Image.new("L", temp_size, 0)
+            mask = Image.new("L", (temp_w, temp_h), 0)
             mask_draw = ImageDraw.Draw(mask)
 
-            center = radius + margin
-
-            mask_draw.ellipse(
-                [center - radius, center - radius, center + radius, center + radius],
-                fill=255,
-            )
+            if size == 1:
+                mask_draw.point((margin, margin), fill=255)
+            else:
+                mask_draw.ellipse([margin, margin, margin + size - 1, margin + size - 1], fill=255)
 
             if blur_radius > 0:
                 mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-            paste_x = x - center
-            paste_y = y - center
+            paste_x = left - margin
+            paste_y = top - margin
 
             mask_pixels = mask.load()
             img_pixels = self.current_image_pil.load()
@@ -3322,15 +3319,16 @@ class SliceWindow(QWidget):
                 self.btn_reset_image.setEnabled(True)
                 self.btn_pick_color.setEnabled(True)
                 self.btn_remove_color.setEnabled(True)
+                self.btn_remove_by_opacity.setEnabled(True)
                 self.btn_toggle_eraser.setEnabled(True)
                 self.btn_toggle_paint.setEnabled(True)
                 self.btn_choose_color.setEnabled(True)
                 self.btn_pick_paint_color.setEnabled(True)  # NOVO
                 self.btn_toggle_selection.setEnabled(True)
-                self.btn_detect_edges.setEnabled(True)
                 self.btn_outline_color.setEnabled(True)
                 self.btn_apply_outline.setEnabled(True)
                 self.btn_erase_edges.setEnabled(True)
+                self.btn_apply_sharpen.setEnabled(True)
 
                 self.btn_apply_color.setEnabled(True)
                 self.btn_reset_color.setEnabled(True)
@@ -3341,10 +3339,6 @@ class SliceWindow(QWidget):
                 self.btn_apply_rotate_fine.setEnabled(True)
                 self.slider_rotate_fine.setEnabled(True)
                 self.spin_rotate_fine.setEnabled(True)
-                
-                # Onde você habilita os outros botões:
-                if REMBG_AVAILABLE:  # ← Use a variável global
-                    self.btn_remove_bg_ai.setEnabled(True)
 
                 # Habilita botões de upscale/denoise
                 self.update_upscale_button_state()
@@ -3401,27 +3395,22 @@ class SliceWindow(QWidget):
         self.btn_reset_image.setEnabled(True)
         self.btn_pick_color.setEnabled(True)
         self.btn_remove_color.setEnabled(True)
+        self.btn_remove_by_opacity.setEnabled(True)
         self.btn_toggle_eraser.setEnabled(True)
         self.btn_toggle_paint.setEnabled(True)
         self.btn_choose_color.setEnabled(True)
         self.btn_pick_paint_color.setEnabled(True)
         self.btn_toggle_selection.setEnabled(True)
-        self.btn_detect_edges.setEnabled(True)
         self.btn_outline_color.setEnabled(True)
         self.btn_apply_outline.setEnabled(True)
         self.btn_erase_edges.setEnabled(True)
+        self.btn_apply_sharpen.setEnabled(True)
 
         self.btn_apply_color.setEnabled(True)
         self.btn_reset_color.setEnabled(True)
         self.chk_enable_fine_grid.setEnabled(True)
         self.btn_cut_size.setEnabled(True)
         self.btn_apply_pixel_snap.setEnabled(True)
-
-        # IA bg remover depende de REMBG_AVAILABLE
-        if REMBG_AVAILABLE:
-            self.btn_remove_bg_ai.setEnabled(True)
-        else:
-            self.btn_remove_bg_ai.setEnabled(False)
 
         # Cria Layer Main baseado nessa imagem em branco
         self.add_main_layer()
@@ -3465,6 +3454,58 @@ class SliceWindow(QWidget):
             return
 
         tolerance = self.spin_tolerance.value()
+        smoothness = getattr(self, 'spin_smoothness', None)
+        smoothness_val = smoothness.value() if smoothness else 0
+
+        try:
+            img = self.current_image_pil.convert("RGBA")
+            datas = img.getdata()
+
+            newData = []
+            pixels_changed = 0
+
+            import math
+
+            for item in datas:
+                r, g, b, a = item
+                if a == 0:
+                    newData.append(item)
+                    continue
+
+                dist = math.sqrt((r - target_rgb[0])**2 + (g - target_rgb[1])**2 + (b - target_rgb[2])**2)
+
+                if dist <= tolerance:
+                    newData.append((r, g, b, 0))
+                    pixels_changed += 1
+                elif smoothness_val > 0 and dist <= tolerance + smoothness_val:
+                    factor = (dist - tolerance) / smoothness_val
+                    new_a = int(a * factor)
+                    newData.append((r, g, b, new_a))
+                    pixels_changed += 1
+                else:
+                    newData.append(item)
+
+            img.putdata(newData)
+            self.current_image_pil = img
+            self.update_canvas_image()
+
+            QMessageBox.information(
+                self,
+                "Color Removed",
+                f"Cor {hex_color} removida!\n{pixels_changed} pixels tornados transparentes.",
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def remove_by_opacity(self):
+        if not self.current_image_pil:
+            return
+
+        self.save_state()
+
+        max_opacity_percent = self.spin_remove_opacity.value()
+        max_opacity_alpha = int((max_opacity_percent / 100.0) * 255)
 
         try:
             img = self.current_image_pil.convert("RGBA")
@@ -3475,27 +3516,12 @@ class SliceWindow(QWidget):
 
             for item in datas:
                 r, g, b, a = item
-
-                if tolerance == 0:
-                    if (r, g, b) == target_rgb:
-                        newData.append((r, g, b, 0))
-                        pixels_changed += 1
-                    else:
-                        newData.append(item)
+                # we don't need to change already fully transparent pixels
+                if a <= max_opacity_alpha and a > 0:
+                    newData.append((r, g, b, 0))
+                    pixels_changed += 1
                 else:
-                    r_diff = abs(r - target_rgb[0])
-                    g_diff = abs(g - target_rgb[1])
-                    b_diff = abs(b - target_rgb[2])
-
-                    if (
-                        r_diff <= tolerance
-                        and g_diff <= tolerance
-                        and b_diff <= tolerance
-                    ):
-                        newData.append((r, g, b, 0))
-                        pixels_changed += 1
-                    else:
-                        newData.append(item)
+                    newData.append(item)
 
             img.putdata(newData)
             self.current_image_pil = img
@@ -3503,8 +3529,8 @@ class SliceWindow(QWidget):
 
             QMessageBox.information(
                 self,
-                "Color Removed",
-                f"Cor {hex_color} removida!\n{pixels_changed} pixels tornados transparentes.",
+                "Opacity Removed",
+                f"{pixels_changed} pixels removidos com opacidade <= {max_opacity_percent}%!",
             )
 
         except Exception as e:
@@ -3521,47 +3547,30 @@ class SliceWindow(QWidget):
                 f"background-color: {color.name()}; border: 1px solid #222;"
             )
 
-    def detect_edges(self):
+    def apply_sharpen(self):
         if not self.current_image_pil:
             return
 
         self.save_state()
 
         try:
-            gray = self.current_image_pil.convert("L")
+            from PIL import ImageFilter
+            radius = self.spin_sharpen_radius.value()
+            percent = self.spin_sharpen_percent.value()
+            threshold = 3
 
-            edges = gray.filter(ImageFilter.FIND_EDGES)
+            if self.current_image_pil.mode == "RGBA":
+                r, g, b, a = self.current_image_pil.split()
+                rgb_image = Image.merge("RGB", (r, g, b))
+                rgb_image = rgb_image.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+                r2, g2, b2 = rgb_image.split()
+                self.current_image_pil = Image.merge("RGBA", (r2, g2, b2, a))
+            else:
+                self.current_image_pil = self.current_image_pil.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
 
-            edges_rgba = edges.convert("RGBA")
-
-            from PIL import ImageOps
-
-            edges_inverted = ImageOps.invert(edges.convert("RGB"))
-            edges_rgba = edges_inverted.convert("RGBA")
-
-            pixels = edges_rgba.load()
-            original_pixels = self.current_image_pil.load()
-            w, h = edges_rgba.size
-
-            for y in range(h):
-                for x in range(w):
-                    r, g, b, a = pixels[x, y]
-                    orig_a = original_pixels[x, y][3]
-
-                    if r < 128 and orig_a > 0:
-                        pixels[x, y] = (0, 0, 0, 255)
-                    else:
-                        pixels[x, y] = (0, 0, 0, 0)
-
-            self.current_image_pil = edges_rgba
             self.update_canvas_image()
-
-            # QMessageBox.information(
-                # self, "Edge Detection", "Bordas detectadas com sucesso!"
-            # )
-
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Erro ao detectar bordas: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Erro ao aplicar sharpening: {str(e)}")
 
     def apply_outline(self):
         if not self.current_image_pil:
@@ -3910,8 +3919,6 @@ class SliceWindow(QWidget):
         self.spin_resize_height.setValue(h)
         self.spin_resize_width.blockSignals(False)
         self.spin_resize_height.blockSignals(False)
-        # Na função reset_to_original() e onde limpar a imagem:
-        self.btn_remove_bg_ai.setEnabled(False)
 
         self.update_canvas_image()
 
@@ -4033,7 +4040,7 @@ class SliceWindow(QWidget):
 
     def on_zoom_change(self, value):
         scale = value / 100.0
-        self.lbl_zoom_val.setText(f"{value}% (Ctrl+Scroll)")
+        self.lbl_zoom_val.setText(f"{value}%")
         self.view.resetTransform()
         self.view.scale(scale, scale)
 
