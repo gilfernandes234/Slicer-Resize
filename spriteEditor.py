@@ -292,10 +292,12 @@ class GridOverlay(QGraphicsObject):
             self.positionChanged.emit(int(new_pos.x()), int(new_pos.y()))
         return super().itemChange(change, value)
 
-    def update_grid(self, rows, cols, subdivisions):
+    def update_grid(self, rows, cols, subdivisions, cell_size=None):
         self.rows = rows
         self.cols = cols
         self.subdivisions = subdivisions
+        if cell_size is not None:
+            self.cell_size = cell_size
         self.prepareGeometryChange()
         self.update()
 
@@ -1080,31 +1082,38 @@ class SliceWindow(QWidget):
         )
         grp_cells_layout.addWidget(self.chk_empty, 1, 0, 1, 2)
 
-        grp_cells_layout.addWidget(QLabel("X:"), 2, 0)
+        grp_cells_layout.addWidget(QLabel("Size:"), 2, 0)
+        self.combo_cell_size = QComboBox()
+        self.combo_cell_size.addItems(["32x32", "64x64", "128x128", "256x256", "512x512"])
+        self.combo_cell_size.setCurrentIndex(0)
+        self.combo_cell_size.currentTextChanged.connect(self.on_cell_size_change)
+        grp_cells_layout.addWidget(self.combo_cell_size, 2, 1)
+
+        grp_cells_layout.addWidget(QLabel("X:"), 3, 0)
         self.spin_x = QSpinBox()
         self.spin_x.setRange(0, 9999)
         self.spin_x.valueChanged.connect(self.on_spinbox_change)
-        grp_cells_layout.addWidget(self.spin_x, 2, 1)
+        grp_cells_layout.addWidget(self.spin_x, 3, 1)
 
-        grp_cells_layout.addWidget(QLabel("Y:"), 3, 0)
+        grp_cells_layout.addWidget(QLabel("Y:"), 4, 0)
         self.spin_y = QSpinBox()
         self.spin_y.setRange(0, 9999)
         self.spin_y.valueChanged.connect(self.on_spinbox_change)
-        grp_cells_layout.addWidget(self.spin_y, 3, 1)
+        grp_cells_layout.addWidget(self.spin_y, 4, 1)
 
-        grp_cells_layout.addWidget(QLabel("Cols:"), 4, 0)
+        grp_cells_layout.addWidget(QLabel("Cols:"), 5, 0)
         self.spin_cols = QSpinBox()
         self.spin_cols.setRange(1, 100)
         self.spin_cols.setValue(1)
         self.spin_cols.valueChanged.connect(self.update_grid_visuals)
-        grp_cells_layout.addWidget(self.spin_cols, 4, 1)
+        grp_cells_layout.addWidget(self.spin_cols, 5, 1)
 
-        grp_cells_layout.addWidget(QLabel("Rows:"), 5, 0)
+        grp_cells_layout.addWidget(QLabel("Rows:"), 6, 0)
         self.spin_rows = QSpinBox()
         self.spin_rows.setRange(1, 100)
         self.spin_rows.setValue(1)
         self.spin_rows.valueChanged.connect(self.update_grid_visuals)
-        grp_cells_layout.addWidget(self.spin_rows, 5, 1)
+        grp_cells_layout.addWidget(self.spin_rows, 6, 1)
 
         grp_cells.setLayout(grp_cells_layout)
         tab_slice_layout.addWidget(grp_cells)
@@ -1890,13 +1899,29 @@ class SliceWindow(QWidget):
             layer_num = len(self.layers)
             new_layer = Layer(f"Layer {layer_num}", new_image, 0, 0)
 
-            self.layers.append(new_layer)
+            if len(self.layers) > 1:
+                reply = QMessageBox.question(
+                    self,
+                    "Posição do Layer",
+                    "Deseja adicionar o novo layer por baixo dos outros layers existentes (acima do Main)?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.layers.insert(1, new_layer)
+                else:
+                    self.layers.append(new_layer)
+            else:
+                self.layers.append(new_layer)
 
             # Cria o widget visual
             self.create_layer_widget(new_layer, is_main=False)
+            
+            self.rebuild_layer_widgets()
 
             # Cria o item gráfico arrastável
             self.create_layer_graphics_item(new_layer)
+            
+            self.update_layer_z_order()
 
             # Seleciona o novo layer
             self.select_layer(new_layer.id)
@@ -2794,10 +2819,22 @@ class SliceWindow(QWidget):
         rect = self.selection_rect_item.rect()
         x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
 
-        transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        self.current_image_pil.paste(transparent_box, (x, y))
+        active_layer = self.get_active_layer()
+        if active_layer and active_layer.name != "Main" and active_layer.image:
+            layer_x = x - active_layer.x
+            layer_y = y - active_layer.y
+            transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            active_layer.image.paste(transparent_box, (layer_x, layer_y))
+            if active_layer.id in self.layer_graphics_items:
+                qim = self.pil_to_qimage(active_layer.image)
+                pix = QPixmap.fromImage(qim)
+                self.layer_graphics_items[active_layer.id].setPixmap(pix)
+            self.compose_and_display_layers()
+        else:
+            transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            self.current_image_pil.paste(transparent_box, (x, y))
+            self.update_canvas_image()
 
-        self.update_canvas_image()
         self.clear_selection()
 
         QMessageBox.information(self, "Cut", "Seleção recortada.")
@@ -2809,15 +2846,29 @@ class SliceWindow(QWidget):
         rect = self.selection_rect_item.rect()
         x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
 
-        img_w, img_h = self.current_image_pil.size
-        if x < 0 or y < 0 or x + w > img_w or y + h > img_h:
-            QMessageBox.warning(
-                self, "Invalid Selection", "Seleção fora dos limites da imagem!"
-            )
-            return
+        active_layer = self.get_active_layer()
+        if active_layer and active_layer.name != "Main" and active_layer.image:
+            img_w, img_h = active_layer.image.size
+            layer_x = x - active_layer.x
+            layer_y = y - active_layer.y
+            if layer_x < 0 or layer_y < 0 or layer_x + w > img_w or layer_y + h > img_h:
+                QMessageBox.warning(
+                    self, "Invalid Selection", "Seleção fora dos limites do layer!"
+                )
+                return
 
-        box = (x, y, x + w, y + h)
-        self.selected_image_data = self.current_image_pil.crop(box)
+            box = (layer_x, layer_y, layer_x + w, layer_y + h)
+            self.selected_image_data = active_layer.image.crop(box)
+        else:
+            img_w, img_h = self.current_image_pil.size
+            if x < 0 or y < 0 or x + w > img_w or y + h > img_h:
+                QMessageBox.warning(
+                    self, "Invalid Selection", "Seleção fora dos limites da imagem!"
+                )
+                return
+
+            box = (x, y, x + w, y + h)
+            self.selected_image_data = self.current_image_pil.crop(box)
 
         self.btn_paste_selection.setEnabled(True)
 
@@ -2827,16 +2878,25 @@ class SliceWindow(QWidget):
 
         self.save_state()
 
-        img_w, img_h = self.current_image_pil.size
         sel_w, sel_h = self.selected_image_data.size
 
-        x = (img_w - sel_w) // 2
-        y = (img_h - sel_h) // 2
+        active_layer = self.get_active_layer()
+        if active_layer and active_layer.name != "Main" and active_layer.image:
+            img_w, img_h = active_layer.image.size
+            x = (img_w - sel_w) // 2
+            y = (img_h - sel_h) // 2
+            # Coordenada na cena = offset do layer + posicao calculada
+            scene_x = active_layer.x + x
+            scene_y = active_layer.y + y
+            self.paste_to_layer_with_expansion(active_layer, self.selected_image_data, scene_x, scene_y)
+        else:
+            img_w, img_h = self.current_image_pil.size
+            x = (img_w - sel_w) // 2
+            y = (img_h - sel_h) // 2
+            self.current_image_pil.paste(self.selected_image_data, (x, y), self.selected_image_data)
+            self.update_canvas_image()
 
-        self.current_image_pil.paste(self.selected_image_data, (x, y))
-        self.update_canvas_image()
-
-        QMessageBox.information(self, "Paste", f"Colado em ({x}, {y})")
+        QMessageBox.information(self, "Paste", "Seleção colada")
 
 
             
@@ -3017,6 +3077,36 @@ class SliceWindow(QWidget):
         else:
             QGraphicsView.mouseReleaseEvent(self.view, event)
 
+    def paste_to_layer_with_expansion(self, active_layer, img_to_paste, scene_x, scene_y):
+        layer_x = scene_x - active_layer.x
+        layer_y = scene_y - active_layer.y
+        
+        min_x = min(0, layer_x)
+        min_y = min(0, layer_y)
+        max_x = max(active_layer.image.width, layer_x + img_to_paste.width)
+        max_y = max(active_layer.image.height, layer_y + img_to_paste.height)
+        
+        if min_x < 0 or min_y < 0 or max_x > active_layer.image.width or max_y > active_layer.image.height:
+            new_w = max_x - min_x
+            new_h = max_y - min_y
+            new_img = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+            new_img.paste(active_layer.image, (-min_x, -min_y))
+            new_img.paste(img_to_paste, (layer_x - min_x, layer_y - min_y), img_to_paste)
+            
+            active_layer.image = new_img
+            active_layer.x += min_x
+            active_layer.y += min_y
+        else:
+            active_layer.image.paste(img_to_paste, (layer_x, layer_y), img_to_paste)
+            
+        if active_layer.id in self.layer_graphics_items:
+            item = self.layer_graphics_items[active_layer.id]
+            qim = self.pil_to_qimage(active_layer.image)
+            pix = QPixmap.fromImage(qim)
+            item.setPixmap(pix)
+            item.setPos(active_layer.x, active_layer.y)
+        self.compose_and_display_layers()
+
     def start_moving_selection(self, scene_pos):
         if not self.current_image_pil or not self.selection_rect_item:
             return
@@ -3028,12 +3118,27 @@ class SliceWindow(QWidget):
         rect = self.selection_rect_item.rect()
         x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
 
-        box = (x, y, x + w, y + h)
-        self.selected_image_data = self.current_image_pil.crop(box)
+        active_layer = self.get_active_layer()
+        if active_layer and active_layer.name != "Main" and active_layer.image:
+            layer_x = x - active_layer.x
+            layer_y = y - active_layer.y
+            box = (layer_x, layer_y, layer_x + w, layer_y + h)
+            self.selected_image_data = active_layer.image.crop(box)
 
-        transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        self.current_image_pil.paste(transparent_box, (x, y))
-        self.update_canvas_image()
+            transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            active_layer.image.paste(transparent_box, (layer_x, layer_y))
+            if active_layer.id in self.layer_graphics_items:
+                qim = self.pil_to_qimage(active_layer.image)
+                pix = QPixmap.fromImage(qim)
+                self.layer_graphics_items[active_layer.id].setPixmap(pix)
+            self.compose_and_display_layers()
+        else:
+            box = (x, y, x + w, y + h)
+            self.selected_image_data = self.current_image_pil.crop(box)
+
+            transparent_box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            self.current_image_pil.paste(transparent_box, (x, y))
+            self.update_canvas_image()
 
         qim = self.pil_to_qimage(self.selected_image_data)
         pix = QPixmap.fromImage(qim)
@@ -3075,8 +3180,12 @@ class SliceWindow(QWidget):
             x, y = int(final_pos.x()), int(final_pos.y())
 
             if self.selected_image_data:
-                self.current_image_pil.paste(self.selected_image_data, (x, y))
-                self.update_canvas_image()
+                active_layer = self.get_active_layer()
+                if active_layer and active_layer.name != "Main" and active_layer.image:
+                    self.paste_to_layer_with_expansion(active_layer, self.selected_image_data, x, y)
+                else:
+                    self.current_image_pil.paste(self.selected_image_data, (x, y), self.selected_image_data)
+                    self.update_canvas_image()
 
             self.scene.removeItem(self.floating_selection_pixmap)
             self.floating_selection_pixmap = None
@@ -3181,7 +3290,7 @@ class SliceWindow(QWidget):
         rows = self.spin_rows.value()
         cols = self.spin_cols.value()
         subs = self.chk_subdivisions.isChecked()
-        self.grid_item.update_grid(rows, cols, subs)
+        self.grid_item.update_grid(rows, cols, subs, self.cell_size)
 
     def open_image(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -3501,14 +3610,6 @@ class SliceWindow(QWidget):
                 outside_near = (dist_from_opaque > 0) & (dist_from_opaque <= thickness)
                 outline_mask_arr[outside_near] = 255
 
-                # For sub-pixel: anti-alias the boundary pixel
-                # Pixels right at the edge get partial alpha
-                boundary = (dist_from_opaque > thickness) & (dist_from_opaque <= thickness + 1.0)
-                if np.any(boundary):
-                    # Fractional coverage: 1.0 at dist==thickness, 0.0 at dist==thickness+1
-                    frac = 1.0 - (dist_from_opaque[boundary] - thickness)
-                    outline_mask_arr[boundary] = (frac * 255).astype(np.uint8)
-
             else:
                 # Feathered outline with smooth falloff
                 outline_mask_arr = np.zeros((h, w), dtype=np.float64)
@@ -3587,15 +3688,6 @@ class SliceWindow(QWidget):
                 # Keep only pixels deeper inside than 'distance'
                 deep_inside = dist_from_edge > distance
                 eroded_arr[deep_inside] = 255
-
-                # Anti-alias the boundary for sub-pixel precision
-                boundary = (dist_from_edge > (distance - 1.0)) & (dist_from_edge <= distance)
-                if np.any(boundary):
-                    # Fractional coverage: 0.0 at dist==distance, 1.0 at dist==distance-1
-                    frac = dist_from_edge[boundary] - (distance - 1.0)
-                    # Clamp to ensure we don't exceed the original alpha
-                    frac = np.clip(frac, 0.0, 1.0)
-                    eroded_arr[boundary] = (frac * 255).astype(np.uint8)
 
                 # Preserve original alpha for pixels that survive (don't make
                 # semi-transparent pixels opaque)
@@ -3927,6 +4019,12 @@ class SliceWindow(QWidget):
         self.spin_y.setValue(y)
         self.spin_x.blockSignals(False)
         self.spin_y.blockSignals(False)
+
+    def on_cell_size_change(self, text):
+        size = int(text.split('x')[0])
+        self.cell_size = size
+        if hasattr(self, 'grid_item') and self.grid_item:
+            self.update_grid_visuals()
 
     def on_spinbox_change(self):
         x = self.spin_x.value()
