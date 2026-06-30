@@ -1,6 +1,6 @@
 # Sprite Editor 
 
-- Resize
+- Resize (Nearest, Lanczos, Bicubic and Bilinear
 - Color Adjust
 - Background Remove
 - Paint Brush
@@ -12,8 +12,12 @@
 - Outline/Adjust
 - Layer Panel
 - Denoise
-- Upscale
+- Upscale (Waifu2x and Real-ESRGRAN)
 - Export
+- Pixel Snap
+- Sharpering
+- Remove Pixel Opacity
+
 
 
 ```bash
@@ -40,7 +44,6 @@ py -m nuitka spriteEditor.py ^
  --include-package=torch ^
  --include-package=basicsr ^
  --include-package=realesrgan ^
- --include-package=rembg ^
  --assume-yes-for-downloads ^
  --low-memory
 ```
