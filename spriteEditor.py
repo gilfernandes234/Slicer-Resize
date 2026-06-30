@@ -51,7 +51,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QDoubleSpinBox,
-    QMenu
+    QMenu,
+    QDialog
 )
 
 
@@ -571,6 +572,11 @@ class SliceWindow(QWidget):
         )
         btn_export_project.clicked.connect(self.export_full_project)
         tb_layout.addWidget(btn_export_project)
+
+        btn_anim_preview = QPushButton("Animation Preview")
+        btn_anim_preview.setStyleSheet("background-color: #17a2b8; padding: 5px; font-weight: bold;")
+        btn_anim_preview.clicked.connect(self.open_animation_preview)
+        tb_layout.addWidget(btn_anim_preview)
 
         tb_layout.addSpacing(20)
 
@@ -3245,8 +3251,8 @@ class SliceWindow(QWidget):
             mask_pixels = mask.load()
             img_pixels = self.current_image_pil.load()
 
-            for py in range(temp_size[1]):
-                for px in range(temp_size[0]):
+            for py in range(temp_h):
+                for px in range(temp_w):
                     img_x = paste_x + px
                     img_y = paste_y + py
 
@@ -4160,6 +4166,13 @@ class SliceWindow(QWidget):
         )
         return qimage
 
+    def open_animation_preview(self):
+        if not hasattr(self, 'anim_preview_window') or self.anim_preview_window is None:
+            self.anim_preview_window = AnimationPreviewWindow(self)
+        self.anim_preview_window.show()
+        self.anim_preview_window.raise_()
+        self.anim_preview_window.activateWindow()
+
     def export_full_project(self):
         """
         Exporta o projeto inteiro como uma única imagem:
@@ -4521,6 +4534,180 @@ class SliceWindow(QWidget):
                 self.update_upscale_button_state()
 
 
+
+class AnimationPreviewWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Animation Preview")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.resize(300, 400)
+        
+        self.parent_editor = parent
+        self.current_frame = 0
+        self.is_playing = False
+        
+        self.init_ui()
+        
+        from PyQt6.QtCore import QTimer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.on_timer_tick)
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Grid settings
+        grid_group = QGroupBox("Grid Settings")
+        grid_group.setStyleSheet("QGroupBox { color: #ddd; } QLabel { color: #ddd; }")
+        grid_layout = QGridLayout(grid_group)
+        
+        self.cmb_play_mode = QComboBox()
+        self.cmb_play_mode.addItems(["Play Column", "Play Row", "Play All (Grid)"])
+        self.cmb_play_mode.setStyleSheet("background-color: #555; color: white;")
+        
+        self.spin_index = QSpinBox()
+        self.spin_index.setRange(1, 100)
+        self.spin_index.setValue(1)
+        self.spin_index.setToolTip("Número da Coluna ou Linha")
+        
+        self.spin_width = QSpinBox(); self.spin_width.setRange(1, 9999); self.spin_width.setValue(32)
+        self.spin_height = QSpinBox(); self.spin_height.setRange(1, 9999); self.spin_height.setValue(32)
+        
+        grid_layout.addWidget(QLabel("Mode:"), 0, 0)
+        grid_layout.addWidget(self.cmb_play_mode, 0, 1)
+        grid_layout.addWidget(QLabel("Index:"), 0, 2)
+        grid_layout.addWidget(self.spin_index, 0, 3)
+        
+        grid_layout.addWidget(QLabel("Width:"), 1, 0)
+        grid_layout.addWidget(self.spin_width, 1, 1)
+        grid_layout.addWidget(QLabel("Height:"), 1, 2)
+        grid_layout.addWidget(self.spin_height, 1, 3)
+        
+        self.chk_skip_idle = QCheckBox("Pular Row 1 (Mod Idle)")
+        self.chk_skip_idle.setStyleSheet("color: #ddd;")
+        grid_layout.addWidget(self.chk_skip_idle, 2, 0, 1, 4)
+        
+        layout.addWidget(grid_group)
+        
+        # Playback settings
+        playback_layout = QHBoxLayout()
+        self.btn_play = QPushButton("Play")
+        self.btn_play.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
+        self.btn_play.clicked.connect(self.toggle_playback)
+        self.spin_fps = QSpinBox()
+        self.spin_fps.setRange(1, 60)
+        self.spin_fps.setValue(10)
+        self.spin_fps.valueChanged.connect(self.update_timer)
+        
+        lbl_fps = QLabel("FPS:")
+        lbl_fps.setStyleSheet("color: #ddd;")
+        
+        playback_layout.addWidget(self.btn_play)
+        playback_layout.addWidget(lbl_fps)
+        playback_layout.addWidget(self.spin_fps)
+        layout.addLayout(playback_layout)
+        
+        # Preview Area
+        self.lbl_preview = QLabel("No Image")
+        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setStyleSheet("background-color: #222; border: 1px solid #555; color: white;")
+        self.lbl_preview.setMinimumSize(128, 128)
+        layout.addWidget(self.lbl_preview, 1)
+        
+        self.setStyleSheet("background-color: #333; color: white;")
+        
+    def toggle_playback(self):
+        if self.is_playing:
+            self.timer.stop()
+            self.is_playing = False
+            self.btn_play.setText("Play")
+            self.btn_play.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
+        else:
+            self.update_timer()
+            self.timer.start()
+            self.is_playing = True
+            self.btn_play.setText("Stop")
+            self.btn_play.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold;")
+            
+    def update_timer(self):
+        fps = self.spin_fps.value()
+        self.timer.setInterval(1000 // fps)
+        
+    def on_timer_tick(self):
+        if not self.parent_editor or not hasattr(self.parent_editor, 'current_image_pil') or not self.parent_editor.current_image_pil:
+            return
+        img = self.parent_editor.current_image_pil
+        if not img:
+            return
+            
+        fw = self.spin_width.value()
+        fh = self.spin_height.value()
+        if fw == 0 or fh == 0:
+            return
+            
+        max_cols = max(1, img.width // fw)
+        max_rows = max(1, img.height // fh)
+        
+        mode = self.cmb_play_mode.currentText()
+        idx = self.spin_index.value() - 1  # 0-indexed
+        skip_idle = self.chk_skip_idle.isChecked()
+        
+        if mode == "Play Column":
+            total = max_rows
+            if skip_idle and total > 1:
+                self.current_frame = 1 + (self.current_frame % (total - 1))
+            else:
+                self.current_frame = (self.current_frame + 1) % total
+            col = min(idx, max_cols - 1)
+            row = self.current_frame
+        elif mode == "Play Row":
+            total = max_cols
+            if skip_idle and total > 1:
+                self.current_frame = 1 + (self.current_frame % (total - 1))
+            else:
+                self.current_frame = (self.current_frame + 1) % total
+            col = self.current_frame
+            row = min(idx, max_rows - 1)
+        else: # Play All
+            total = max_cols * max_rows
+            if skip_idle and total > 1:
+                self.current_frame = 1 + (self.current_frame % (total - 1))
+            else:
+                self.current_frame = (self.current_frame + 1) % total
+            col = self.current_frame % max_cols
+            row = self.current_frame // max_cols
+        
+        x = col * fw
+        y = row * fh
+        
+        if x >= img.width or y >= img.height:
+            # Pula frame se sair da imagem
+            return
+            
+        box = (x, y, min(x + fw, img.width), min(y + fh, img.height))
+        frame_img = img.crop(box)
+        
+        # Convert PIL to QPixmap
+        from PyQt6.QtGui import QPixmap, QImage
+        mode = frame_img.mode
+        if mode == 'RGBA':
+            data = frame_img.tobytes("raw", "RGBA")
+            qim = QImage(data, frame_img.width, frame_img.height, QImage.Format.Format_RGBA8888)
+        elif mode == 'RGB':
+            data = frame_img.tobytes("raw", "RGB")
+            qim = QImage(data, frame_img.width, frame_img.height, QImage.Format.Format_RGB888)
+        else:
+            frame_img = frame_img.convert("RGBA")
+            data = frame_img.tobytes("raw", "RGBA")
+            qim = QImage(data, frame_img.width, frame_img.height, QImage.Format.Format_RGBA8888)
+            
+        pixmap = QPixmap.fromImage(qim)
+        scaled_pixmap = pixmap.scaled(self.lbl_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        self.lbl_preview.setPixmap(scaled_pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.is_playing:
+            self.on_timer_tick()
 
 if __name__ == "__main__":
     import sys
